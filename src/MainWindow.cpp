@@ -1,24 +1,24 @@
 #include "MainWindow.h"
-#include "./delegates/HtmlDelegate.h"
-#include "./exceptions/ImageNotSupportedException.h"
+#include "delegates/HtmlDelegate.h"
+#include "exceptions/ImageNotSupportedException.h"
 #include "exceptions/ImageTooBigException.h"
+#include "filters/QSliderScrollFilter.h"
 #include "ui_MainWindow.h"
+#include "utils/LanguageManager.h"
 #include "utils/Logger.h"
-
+#include "utils/PostCompressionActions.h"
 #include <QDesktopServices>
 #include <QFileDialog>
-#include <QMessageBox>
 #include <QMovie>
 #include <QProgressBar>
 #include <QProgressDialog>
 #include <QScrollBar>
-#include <QStandardPaths>
-#include <QTime>
 #include <QWheelEvent>
-#include <QWidgetAction>
 #include <QWindow>
 #include <QtConcurrent>
+#include <dialogs/AdvancedImportDialog.h>
 #include <dialogs/PreferencesDialog.h>
+#include <services/Importer.h>
 #include <utility>
 #include <widgets/QCaesiumMessageBox.h>
 
@@ -29,15 +29,22 @@
 
 #ifdef Q_OS_WIN
 #include "./updater/win/winsparkle.h"
-#include "utils/LanguageManager.h"
 #endif
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
 {
+    qRegisterMetaType<QList<int>>();
+    qRegisterMetaType<QWheelEvent*>();
+    qRegisterMetaType<Qt::CheckState>();
+    qRegisterMetaType<Qt::SortOrder>();
+
     ui->setupUi(this);
     qInfo() << "Starting UI";
+
+    this->translator = new QTranslator();
+    LanguageManager::loadLocale(translator);
 
     this->cImageModel = new CImageTreeModel();
     this->aboutDialog = new AboutDialog(this);
@@ -48,6 +55,8 @@ MainWindow::MainWindow(QWidget* parent)
     this->networkOperations = new NetworkOperations();
     this->proxyModel = new CImageSortFilterProxyModel();
     this->trayIcon = new QSystemTrayIcon();
+
+    ui->sidebar_HSplitter->setCollapsible(1, true);
 
     this->initListWidget();
 
@@ -60,12 +69,26 @@ MainWindow::MainWindow(QWidget* parent)
     this->keepDatesButtonGroup->addButton(ui->keepLastModifiedDate_CheckBox);
     this->keepDatesButtonGroup->addButton(ui->keepLastAccessDate_CheckBox);
 
-    ui->format_ComboBox->addItems(OUTPUT_SUPPORTED_FORMATS);
-
     this->initStatusBar();
     this->initListContextMenu();
     this->initTrayIconContextMenu();
     this->initTrayIcon();
+    this->setupCompressButton();
+
+    ui->format_ComboBox->addItems(getOutputSupportedFormats());
+    this->setupChromaSubsamplingComboBox();
+
+    ui->JPEGToggle_ToolButton->setContent(ui->JPEGOptions_Frame);
+    ui->PNGToggle_ToolButton->setContent(ui->PNGOptions_Frame);
+    ui->WebPToggle_ToolButton->setContent(ui->WebPOptions_Frame);
+    ui->TIFFToggle_ToolButton->setContent(ui->TIFFOptions_Frame);
+
+    this->installCompressionOptionsEventFilter();
+
+    connect(ui->JPEGToggle_ToolButton, &QCollapseToolButton::contentVisibilityToggled, this, &MainWindow::onJPEGOptionsVisibilityChanged);
+    connect(ui->PNGToggle_ToolButton, &QCollapseToolButton::contentVisibilityToggled, this, &MainWindow::onPNGOptionsVisibilityChanged);
+    connect(ui->WebPToggle_ToolButton, &QCollapseToolButton::contentVisibilityToggled, this, &MainWindow::onWebPOptionsVisibilityChanged);
+    connect(ui->TIFFToggle_ToolButton, &QCollapseToolButton::contentVisibilityToggled, this, &MainWindow::onTIFFOptionsVisibilityChanged);
 
     connect(ui->imageList_TreeView->selectionModel(), &QItemSelectionModel::selectionChanged, this, &MainWindow::imageList_selectionChanged);
     connect(ui->imageList_TreeView, &QDropTreeView::dropFinished, this, &MainWindow::dropFinished);
@@ -84,23 +107,47 @@ MainWindow::MainWindow(QWidget* parent)
     connect(this->previewWatcher, &QFutureWatcher<ImagePreview>::resultReadyAt, this, &MainWindow::showPreview);
     connect(this->previewWatcher, &QFutureWatcher<ImagePreview>::finished, this, &MainWindow::previewFinished);
     connect(this->previewWatcher, &QFutureWatcher<ImagePreview>::canceled, this, &MainWindow::previewCanceled);
+    connect(ui->compressionMode_ComboBox, &QComboBox::currentIndexChanged, ui->compression_StackedWidget, &QStackedWidget::setCurrentIndex);
+    connect(ui->compressionMode_ComboBox, &QComboBox::currentIndexChanged, this, &MainWindow::onCompressionModeChanged);
+    connect(ui->maxOutputSize_SpinBox, &QSpinBox::valueChanged, this, &MainWindow::onMaxOutputSizeChanged);
+    connect(ui->maxOutputSizeUnit_ComboBox, &QComboBox::currentIndexChanged, this, &MainWindow::onMaxOutputSizeUnitChanged);
+
+    connect(ui->actionAdvanced_import, &QAction::triggered, this, &MainWindow::onAdvancedImportTriggered);
+
+    connect(ui->moveOriginalFile_CheckBox, &QCheckBox::toggled, this, &MainWindow::moveOriginalFileToggled);
+    connect(ui->moveOriginalFile_ComboBox, &QComboBox::currentIndexChanged, this, &MainWindow::moveOriginalFileDestinationChanged);
+
+    connect(ui->JPEGQuality_Slider, &QSlider::valueChanged, this, &MainWindow::onJPEGQualityValueChanged);
+    connect(ui->JPEGQuality_SpinBox, &QSpinBox::valueChanged, this, &MainWindow::onJPEGQualityValueChanged);
+    connect(ui->PNGQuality_Slider, &QSlider::valueChanged, this, &MainWindow::onPNGQualityValueChanged);
+    connect(ui->PNGQuality_SpinBox, &QSpinBox::valueChanged, this, &MainWindow::onPNGQualityValueChanged);
+    connect(ui->WebPQuality_Slider, &QSlider::valueChanged, this, &MainWindow::onWebPQualityValueChanged);
+    connect(ui->WebPQuality_SpinBox, &QSpinBox::valueChanged, this, &MainWindow::onWebPQualityValueChanged);
+    connect(ui->JPEGChromaSubsampling_ComboBox, &QComboBox::currentIndexChanged, this, &MainWindow::onJPEGChromaSubsamplingChanged);
+    connect(ui->JPEGProgressive_CheckBox, &QCheckBox::toggled, this, &MainWindow::onJPEGProgressiveToggled);
+    connect(ui->PNGOptimizationLevel_Slider, &QSlider::valueChanged, this, &MainWindow::onPNGOptimizationLevelChanged);
+    connect(ui->PNGOptimizationLevel_SpinBox, &QSpinBox::valueChanged, this, &MainWindow::onPNGOptimizationLevelChanged);
+
+    connect(ui->TIFFCompressionMethod_ComboBox, &QComboBox::currentIndexChanged, this, &MainWindow::onTIFFCompressionMethodChanged);
+    connect(ui->TIFFDeflateLevel_Slider, &QSlider::valueChanged, this, &MainWindow::onTIFFDeflateLevelChanged);
     this->readSettings();
 
     connect(ui->format_ComboBox, &QComboBox::currentIndexChanged, this, &MainWindow::outputFormatIndexChanged);
 
-    this->on_fitTo_ComboBox_currentIndexChanged(ui->fitTo_ComboBox->currentIndex());
     this->on_keepAspectRatio_CheckBox_toggled(ui->keepAspectRatio_CheckBox->isChecked());
     this->on_doNotEnlarge_CheckBox_toggled(ui->doNotEnlarge_CheckBox->isChecked());
     this->on_keepAspectRatio_CheckBox_toggled(ui->keepAspectRatio_CheckBox->isChecked());
-    this->on_sameOutputFolderAsInput_CheckBox_toggled(ui->sameOutputFolderAsInput_CheckBox->isChecked());
+    MainWindow::on_sameOutputFolderAsInput_CheckBox_toggled(ui->sameOutputFolderAsInput_CheckBox->isChecked());
+    this->moveOriginalFileToggled(ui->moveOriginalFile_CheckBox->isChecked());
+    this->on_fitTo_ComboBox_currentIndexChanged(ui->fitTo_ComboBox->currentIndex());
+    this->toggleLosslessWarningVisible();
 
     ui->actionToolbarIcons_only->setChecked(ui->toolBar->toolButtonStyle() == Qt::ToolButtonIconOnly && !ui->toolBar->isHidden());
     ui->actionToolbarIcons_and_Text->setChecked(ui->toolBar->toolButtonStyle() == Qt::ToolButtonTextUnderIcon && !ui->toolBar->isHidden());
     ui->actionToolbarHide->setChecked(ui->toolBar->isHidden());
 
-    QSettings settings;
-    if (settings.value("preferences/general/send_usage_reports", false).toBool()) {
-        if (!settings.contains("access_token")) {
+    if (QSettings().value("preferences/general/send_usage_reports", true).toBool()) {
+        if (!QSettings().contains("access_token")) {
             this->networkOperations->requestToken();
         } else {
             this->networkOperations->updateSystemInfo();
@@ -109,12 +156,11 @@ MainWindow::MainWindow(QWidget* parent)
 
     QCommandLineParser commandLineParser;
     commandLineParser.process(QApplication::arguments());
-    const QStringList args = commandLineParser.positionalArguments();
-    if (!args.isEmpty()) {
+    if (const QStringList args = commandLineParser.positionalArguments(); !args.isEmpty()) {
         this->importFromArgs(args);
     }
 
-    QImageReader::setAllocationLimit(512);
+    QImageReader::setAllocationLimit(1024);
 }
 
 MainWindow::~MainWindow()
@@ -131,6 +177,7 @@ MainWindow::~MainWindow()
     delete networkOperations;
     delete previewWatcher;
     delete trayIcon;
+    delete translator;
     delete ui;
 }
 
@@ -138,15 +185,17 @@ void MainWindow::showEvent(QShowEvent* event)
 {
     QMainWindow::showEvent(event);
 
-    this->initUpdater();
+    MainWindow::initUpdater();
 }
 
-void MainWindow::initStatusBar()
+void MainWindow::initStatusBar() const
 {
+    ui->statusbar->addPermanentWidget(ui->losslessWarning_Button);
     ui->statusbar->addPermanentWidget(ui->compressionProgress_Label);
     ui->statusbar->addPermanentWidget(ui->compression_ProgressBar);
     ui->statusbar->addPermanentWidget(ui->cancelCompression_Button);
 
+    ui->losslessWarning_Button->hide();
     ui->cancelCompression_Button->hide();
     ui->compression_ProgressBar->hide();
     ui->compressionProgress_Label->hide();
@@ -174,22 +223,21 @@ void MainWindow::initTrayIconContextMenu()
     connect(exitAction, &QAction::triggered, ui->actionExit, &QAction::triggered);
 }
 
-void MainWindow::initListWidget()
+void MainWindow::initListWidget() const
 {
-    QSettings settings;
     int defaultSectionSize = ui->imageList_TreeView->header()->defaultSectionSize();
     this->proxyModel->setSourceModel(this->cImageModel);
     ui->imageList_TreeView->setModel(this->proxyModel);
     ui->imageList_TreeView->setIconSize(QSize(10, 10));
-    ui->imageList_TreeView->header()->resizeSection(CImageColumns::NAME_COLUMN, settings.value("mainwindow/list_view/header_column_size/name", 250).toInt());
-    ui->imageList_TreeView->header()->resizeSection(CImageColumns::SIZE_COLUMN, settings.value("mainwindow/list_view/header_column_size/size", defaultSectionSize).toInt());
-    ui->imageList_TreeView->header()->resizeSection(CImageColumns::RESOLUTION_COLUMN, settings.value("mainwindow/list_view/header_column_size/resolution", defaultSectionSize).toInt());
-    ui->imageList_TreeView->header()->resizeSection(CImageColumns::RATIO_COLUMN, settings.value("mainwindow/list_view/header_column_size/ratio", defaultSectionSize).toInt());
+    ui->imageList_TreeView->header()->resizeSection(CImageColumns::NAME_COLUMN, QSettings().value("mainwindow/list_view/header_column_size/name", 250).toInt());
+    ui->imageList_TreeView->header()->resizeSection(CImageColumns::SIZE_COLUMN, QSettings().value("mainwindow/list_view/header_column_size/size", defaultSectionSize).toInt());
+    ui->imageList_TreeView->header()->resizeSection(CImageColumns::RESOLUTION_COLUMN, QSettings().value("mainwindow/list_view/header_column_size/resolution", defaultSectionSize).toInt());
+    ui->imageList_TreeView->header()->resizeSection(CImageColumns::RATIO_COLUMN, QSettings().value("mainwindow/list_view/header_column_size/ratio", defaultSectionSize).toInt());
 
-    ui->imageList_TreeView->header()->setSortIndicator(settings.value("mainwindow/list_view/sort_column_index", 0).toInt(), settings.value("mainwindow/list_view/sort_column_order", Qt::AscendingOrder).value<Qt::SortOrder>());
+    ui->imageList_TreeView->header()->setSortIndicator(QSettings().value("mainwindow/list_view/sort_column_index", 0).toInt(), QSettings().value("mainwindow/list_view/sort_column_order", Qt::AscendingOrder).value<Qt::SortOrder>());
 
-    ui->imageList_TreeView->header()->resizeSection(CImageColumns::RATIO_COLUMN, settings.value("mainwindow/list_view/header_column_size/ratio", defaultSectionSize).toInt());
-    ui->imageList_TreeView->header()->resizeSection(CImageColumns::RATIO_COLUMN, settings.value("mainwindow/list_view/header_column_size/ratio", defaultSectionSize).toInt());
+    ui->imageList_TreeView->header()->resizeSection(CImageColumns::RATIO_COLUMN, QSettings().value("mainwindow/list_view/header_column_size/ratio", defaultSectionSize).toInt());
+    ui->imageList_TreeView->header()->resizeSection(CImageColumns::RATIO_COLUMN, QSettings().value("mainwindow/list_view/header_column_size/ratio", defaultSectionSize).toInt());
     ui->imageList_TreeView->setItemDelegate(new HtmlDelegate());
 }
 
@@ -208,7 +256,7 @@ void MainWindow::initTrayIcon()
     this->trayIcon->show();
 }
 
-void MainWindow::on_actionAbout_Caesium_Image_Compressor_triggered()
+void MainWindow::on_actionAbout_Caesium_Image_Compressor_triggered() const
 {
     aboutDialog->setWindowModality(Qt::NonModal);
     aboutDialog->show();
@@ -230,7 +278,7 @@ void MainWindow::triggerImportFiles()
     QStringList fileList = QFileDialog::getOpenFileNames(this,
         tr("Import files..."),
         this->lastOpenedDirectory,
-        QIODevice::tr("Image Files") + " (*.jpg *.jpeg *.png *.webp)");
+        QIODevice::tr("Image Files") + " (*.jpg *.jpeg *.png *.webp *.tif *.tiff)");
 
     if (fileList.isEmpty()) {
         return;
@@ -252,9 +300,8 @@ void MainWindow::triggerImportFolder()
         return;
     }
 
-    QSettings settings;
-    bool scanSubfolders = settings.value("preferences/general/import_subfolders", true).toBool();
-    QStringList fileList = scanDirectory(directoryPath, scanSubfolders);
+    bool scanSubfolders = QSettings().value("preferences/general/import_subfolders", true).toBool();
+    QStringList fileList = Importer::scanDirectory(directoryPath, scanSubfolders);
 
     if (fileList.isEmpty()) {
         return;
@@ -264,113 +311,128 @@ void MainWindow::triggerImportFolder()
     return this->importFiles(fileList, directoryPath);
 }
 
-void MainWindow::writeSettings()
+void MainWindow::writeSettings() const
 {
-    QSettings settings;
-    settings.setValue("mainwindow/maximized", this->isMaximized());
-    settings.setValue("mainwindow/size", this->size());
-    settings.setValue("mainwindow/pos", this->pos());
-    settings.setValue("mainwindow/left_splitter_sizes", QVariant::fromValue<QList<int>>(ui->sidebar_HSplitter->sizes()));
-    settings.setValue("mainwindow/previews_visible", ui->actionShow_previews->isChecked());
-    settings.setValue("mainwindow/auto_preview", ui->actionAuto_preview->isChecked());
+    QSettings().setValue("mainwindow/geometry", this->saveGeometry());
+    QSettings().setValue("mainwindow/window_state", this->saveState());
+    QSettings().setValue("mainwindow/left_splitter_sizes", QVariant::fromValue<QList<int>>(ui->sidebar_HSplitter->sizes()));
+    QSettings().setValue("mainwindow/previews_visible", ui->actionShow_previews->isChecked());
+    QSettings().setValue("mainwindow/auto_preview", ui->actionAuto_preview->isChecked());
 
     if (ui->actionShow_previews->isChecked()) {
-        settings.setValue("mainwindow/main_splitter_sizes", QVariant::fromValue<QList<int>>(ui->main_VSplitter->sizes()));
+        QSettings().setValue("mainwindow/main_splitter_sizes", QVariant::fromValue<QList<int>>(ui->main_VSplitter->sizes()));
     }
-    settings.setValue("mainwindow/list_view/header_column_size/name", ui->imageList_TreeView->header()->sectionSize(CImageColumns::NAME_COLUMN));
-    settings.setValue("mainwindow/list_view/header_column_size/size", ui->imageList_TreeView->header()->sectionSize(CImageColumns::SIZE_COLUMN));
-    settings.setValue("mainwindow/list_view/header_column_size/resolution", ui->imageList_TreeView->header()->sectionSize(CImageColumns::RESOLUTION_COLUMN));
-    settings.setValue("mainwindow/list_view/header_column_size/ratio", ui->imageList_TreeView->header()->sectionSize(CImageColumns::RATIO_COLUMN));
-    settings.setValue("mainwindow/list_view/sort_column_index", ui->imageList_TreeView->header()->sortIndicatorSection());
-    settings.setValue("mainwindow/list_view/sort_column_order", ui->imageList_TreeView->header()->sortIndicatorOrder());
-    settings.setValue("mainwindow/toolbar/visible", ui->toolBar->isVisible());
-    settings.setValue("mainwindow/toolbar/button_style", ui->toolBar->toolButtonStyle());
+    QSettings().setValue("mainwindow/list_view/header_column_size/name", ui->imageList_TreeView->header()->sectionSize(CImageColumns::NAME_COLUMN));
+    QSettings().setValue("mainwindow/list_view/header_column_size/size", ui->imageList_TreeView->header()->sectionSize(CImageColumns::SIZE_COLUMN));
+    QSettings().setValue("mainwindow/list_view/header_column_size/resolution", ui->imageList_TreeView->header()->sectionSize(CImageColumns::RESOLUTION_COLUMN));
+    QSettings().setValue("mainwindow/list_view/header_column_size/ratio", ui->imageList_TreeView->header()->sectionSize(CImageColumns::RATIO_COLUMN));
+    QSettings().setValue("mainwindow/list_view/sort_column_index", ui->imageList_TreeView->header()->sortIndicatorSection());
+    QSettings().setValue("mainwindow/list_view/sort_column_order", ui->imageList_TreeView->header()->sortIndicatorOrder());
+    QSettings().setValue("mainwindow/toolbar/visible", ui->toolBar->isVisible());
+    QSettings().setValue("mainwindow/toolbar/button_style", ui->toolBar->toolButtonStyle());
+    QSettings().setValue("mainwindow/compression/jpeg_options_visible", ui->JPEGToggle_ToolButton->contentVisible());
+    QSettings().setValue("mainwindow/compression/png_options_visible", ui->PNGToggle_ToolButton->contentVisible());
+    QSettings().setValue("mainwindow/compression/webp_options_visible", ui->WebPToggle_ToolButton->contentVisible());
+    QSettings().setValue("mainwindow/compression/tiff_options_visible", ui->TIFFToggle_ToolButton->contentVisible());
 
-    settings.setValue("compression_options/compression/lossless", ui->lossless_CheckBox->isChecked());
-    settings.setValue("compression_options/compression/keep_metadata", ui->keepMetadata_CheckBox->isChecked());
-    settings.setValue("compression_options/compression/keep_structure", ui->keepStructure_CheckBox->isChecked());
-    settings.setValue("compression_options/compression/jpeg_quality", ui->JPEGQuality_Slider->value());
-    settings.setValue("compression_options/compression/png_quality", ui->PNGQuality_Slider->value());
-    settings.setValue("compression_options/compression/webp_quality", ui->WebPQuality_Slider->value());
+    QSettings().setValue("compression_options/compression/mode", ui->compressionMode_ComboBox->currentIndex());
+    QSettings().setValue("compression_options/compression/lossless", ui->lossless_CheckBox->isChecked());
+    QSettings().setValue("compression_options/compression/keep_metadata", ui->keepMetadata_CheckBox->isChecked());
+    QSettings().setValue("compression_options/compression/keep_structure", ui->keepStructure_CheckBox->isChecked());
+    QSettings().setValue("compression_options/compression/jpeg_quality", ui->JPEGQuality_Slider->value());
+    QSettings().setValue("compression_options/compression/jpeg_chroma_subsampling", ui->JPEGChromaSubsampling_ComboBox->currentData(Qt::UserRole));
+    QSettings().setValue("compression_options/compression/jpeg_progressive", ui->JPEGProgressive_CheckBox->isChecked());
+    QSettings().setValue("compression_options/compression/png_quality", ui->PNGQuality_Slider->value());
+    QSettings().setValue("compression_options/compression/png_optimization_level", ui->PNGOptimizationLevel_Slider->value());
+    QSettings().setValue("compression_options/compression/webp_quality", ui->WebPQuality_Slider->value());
+    QSettings().setValue("compression_options/compression/tiff_method", ui->TIFFCompressionMethod_ComboBox->currentIndex());
+    QSettings().setValue("compression_options/compression/tiff_deflate_level", ui->TIFFDeflateLevel_Slider->value());
+    QSettings().setValue("compression_options/compression/max_output_size", ui->maxOutputSize_SpinBox->value());
+    QSettings().setValue("compression_options/compression/max_output_size_unit", ui->maxOutputSizeUnit_ComboBox->currentIndex());
 
-    settings.setValue("compression_options/resize/resize", ui->fitTo_ComboBox->currentIndex() != ResizeMode::NO_RESIZE);
-    settings.setValue("compression_options/resize/fit_to", ui->fitTo_ComboBox->currentIndex());
-    settings.setValue("compression_options/resize/width", ui->width_SpinBox->value());
-    settings.setValue("compression_options/resize/height", ui->height_SpinBox->value());
-    settings.setValue("compression_options/resize/size", ui->edge_SpinBox->value());
-    settings.setValue("compression_options/resize/keep_aspect_ratio", ui->keepAspectRatio_CheckBox->isChecked());
-    settings.setValue("compression_options/resize/do_not_enlarge", ui->doNotEnlarge_CheckBox->isChecked());
+    QSettings().setValue("compression_options/resize/resize", ui->fitTo_ComboBox->currentIndex() != ResizeMode::NO_RESIZE);
+    QSettings().setValue("compression_options/resize/fit_to", ui->fitTo_ComboBox->currentIndex());
+    QSettings().setValue("compression_options/resize/width", ui->width_SpinBox->value());
+    QSettings().setValue("compression_options/resize/height", ui->height_SpinBox->value());
+    QSettings().setValue("compression_options/resize/size", ui->edge_SpinBox->value());
+    QSettings().setValue("compression_options/resize/keep_aspect_ratio", ui->keepAspectRatio_CheckBox->isChecked());
+    QSettings().setValue("compression_options/resize/do_not_enlarge", ui->doNotEnlarge_CheckBox->isChecked());
 
-    settings.setValue("compression_options/output/output_folder", ui->outputFolder_LineEdit->text());
-    settings.setValue("compression_options/output/output_suffix", ui->outputSuffix_LineEdit->text());
-    settings.setValue("compression_options/output/same_folder_as_input", ui->sameOutputFolderAsInput_CheckBox->isChecked());
-    settings.setValue("compression_options/output/skip_if_bigger", ui->skipIfBigger_CheckBox->isChecked());
-    settings.setValue("compression_options/output/keep_dates", ui->keepDates_CheckBox->checkState());
-    settings.setValue("compression_options/output/keep_creation_date", ui->keepCreationDate_CheckBox->isChecked());
-    settings.setValue("compression_options/output/keep_last_modified_date", ui->keepLastModifiedDate_CheckBox->isChecked());
-    settings.setValue("compression_options/output/keep_last_access_date", ui->keepLastAccessDate_CheckBox->isChecked());
-    settings.setValue("compression_options/output/format", ui->format_ComboBox->currentIndex());
+    QSettings().setValue("compression_options/output/output_folder", ui->outputFolder_LineEdit->text());
+    QSettings().setValue("compression_options/output/output_suffix", ui->outputSuffix_LineEdit->text());
+    QSettings().setValue("compression_options/output/same_folder_as_input", ui->sameOutputFolderAsInput_CheckBox->isChecked());
+    QSettings().setValue("compression_options/output/skip_if_bigger", ui->skipIfBigger_CheckBox->isChecked());
+    QSettings().setValue("compression_options/output/keep_dates", ui->keepDates_CheckBox->checkState());
+    QSettings().setValue("compression_options/output/keep_creation_date", ui->keepCreationDate_CheckBox->isChecked());
+    QSettings().setValue("compression_options/output/keep_last_modified_date", ui->keepLastModifiedDate_CheckBox->isChecked());
+    QSettings().setValue("compression_options/output/keep_last_access_date", ui->keepLastAccessDate_CheckBox->isChecked());
+    QSettings().setValue("compression_options/output/format", ui->format_ComboBox->currentIndex());
+    QSettings().setValue("compression_options/output/move_original_file", ui->moveOriginalFile_CheckBox->isChecked());
+    QSettings().setValue("compression_options/output/move_original_file_destination", ui->moveOriginalFile_ComboBox->currentIndex());
 
-    settings.setValue("extra/last_opened_directory", this->lastOpenedDirectory);
-}
-
-void MainWindow::writeSetting(const QString& key, const QVariant& value)
-{
-    QSettings().setValue(key, value);
+    QSettings().setValue("extra/last_opened_directory", this->lastOpenedDirectory);
 }
 
 void MainWindow::readSettings()
 {
-    QSettings settings;
-    this->resize(settings.value("mainwindow/size").toSize());
-    this->move(settings.value("mainwindow/pos").toPoint());
-    if (settings.value("mainwindow/maximized", false).toBool()) {
-        this->showMaximized();
-    }
+    this->restoreGeometry(QSettings().value("mainwindow/geometry").toByteArray());
+    this->restoreState(QSettings().value("mainwindow/window_state").toByteArray());
+    ui->sidebar_HSplitter->setSizes(QSettings().value("mainwindow/left_splitter_sizes", QVariant::fromValue<QList<int>>({ 600, 1 })).value<QList<int>>());
+    ui->main_VSplitter->setSizes(QSettings().value("mainwindow/main_splitter_sizes", QVariant::fromValue<QList<int>>({ 500, 250 })).value<QList<int>>());
+    ui->actionShow_previews->setChecked(QSettings().value("mainwindow/previews_visible", true).toBool());
+    ui->actionAuto_preview->setChecked(QSettings().value("mainwindow/auto_preview", false).toBool());
+    ui->toolBar->setVisible(QSettings().value("mainwindow/toolbar/visible", true).toBool());
+    ui->toolBar->setToolButtonStyle(QSettings().value("mainwindow/toolbar/button_style", Qt::ToolButtonIconOnly).value<Qt::ToolButtonStyle>());
+    ui->JPEGToggle_ToolButton->setContentVisible(QSettings().value("mainwindow/compression/jpeg_options_visible", true).toBool());
+    ui->PNGToggle_ToolButton->setContentVisible(QSettings().value("mainwindow/compression/png_options_visible", true).toBool());
+    ui->WebPToggle_ToolButton->setContentVisible(QSettings().value("mainwindow/compression/webp_options_visible", true).toBool());
+    ui->TIFFToggle_ToolButton->setContentVisible(QSettings().value("mainwindow/compression/tiff_options_visible", true).toBool());
 
-    ui->sidebar_HSplitter->setSizes(settings.value("mainwindow/left_splitter_sizes", QVariant::fromValue<QList<int>>({ 600, 1 })).value<QList<int>>());
-    ui->main_VSplitter->setSizes(settings.value("mainwindow/main_splitter_sizes", QVariant::fromValue<QList<int>>({ 500, 250 })).value<QList<int>>());
-    ui->actionShow_previews->setChecked(settings.value("mainwindow/previews_visible", true).toBool());
-    ui->actionAuto_preview->setChecked(settings.value("mainwindow/auto_preview", false).toBool());
-    ui->toolBar->setVisible(settings.value("mainwindow/toolbar/visible", true).toBool());
-    ui->toolBar->setToolButtonStyle(settings.value("mainwindow/toolbar/button_style", Qt::ToolButtonIconOnly).value<Qt::ToolButtonStyle>());
+    ui->compressionMode_ComboBox->setCurrentIndex(QSettings().value("compression_options/compression/mode", 0).toInt());
+    ui->lossless_CheckBox->setChecked(QSettings().value("compression_options/compression/lossless", false).toBool());
+    ui->keepMetadata_CheckBox->setChecked(QSettings().value("compression_options/compression/keep_metadata", true).toBool());
+    ui->keepStructure_CheckBox->setChecked(QSettings().value("compression_options/compression/keep_structure", false).toBool());
+    ui->JPEGQuality_Slider->setValue(QSettings().value("compression_options/compression/jpeg_quality", 80).toInt());
+    ui->JPEGChromaSubsampling_ComboBox->setCurrentIndex(static_cast<int>(getChromaSubsamplingOptions().keys().indexOf(QSettings().value("compression_options/compression/jpeg_chroma_subsampling", 0).toInt())));
+    ui->JPEGProgressive_CheckBox->setChecked(QSettings().value("compression_options/compression/jpeg_progressive", true).toBool());
+    ui->PNGQuality_SpinBox->setValue(QSettings().value("compression_options/compression/png_quality", 80).toInt());
+    ui->PNGOptimizationLevel_Slider->setValue(QSettings().value("compression_options/compression/png_optimization_level", 3).toInt());
+    ui->JPEGQuality_SpinBox->setValue(QSettings().value("compression_options/compression/jpeg_quality", 80).toInt());
+    ui->WebPQuality_SpinBox->setValue(QSettings().value("compression_options/compression/webp_quality", 60).toInt());
+    ui->TIFFCompressionMethod_ComboBox->setCurrentIndex(QSettings().value("compression_options/compression/tiff_method", 1).toInt());
+    ui->TIFFDeflateLevel_Slider->setValue(QSettings().value("compression_options/compression/tiff_deflate_level", 2).toInt());
+    ui->maxOutputSize_SpinBox->setValue(QSettings().value("compression_options/compression/max_output_size", 500).toInt());
+    ui->maxOutputSizeUnit_ComboBox->setCurrentIndex(QSettings().value("compression_options/compression/max_output_size_unit", 0).toInt());
 
-    ui->lossless_CheckBox->setChecked(settings.value("compression_options/compression/lossless", false).toBool());
-    ui->keepMetadata_CheckBox->setChecked(settings.value("compression_options/compression/keep_metadata", true).toBool());
-    ui->keepStructure_CheckBox->setChecked(settings.value("compression_options/compression/keep_structure", false).toBool());
-    ui->JPEGQuality_Slider->setValue(settings.value("compression_options/compression/jpeg_quality", 80).toInt());
-    ui->PNGQuality_SpinBox->setValue(settings.value("compression_options/compression/png_quality", 80).toInt());
-    ui->JPEGQuality_SpinBox->setValue(settings.value("compression_options/compression/jpeg_quality", 80).toInt());
-    ui->WebPQuality_SpinBox->setValue(settings.value("compression_options/compression/webp_quality", 60).toInt());
+    ui->fitTo_ComboBox->setCurrentIndex(QSettings().value("compression_options/resize/fit_to", 0).toInt());
+    ui->width_SpinBox->setValue(QSettings().value("compression_options/resize/width", 1000).toInt());
+    ui->height_SpinBox->setValue(QSettings().value("compression_options/resize/height", 1000).toInt());
+    ui->edge_SpinBox->setValue(QSettings().value("compression_options/resize/size", 1000).toInt());
+    ui->keepAspectRatio_CheckBox->setChecked(QSettings().value("compression_options/resize/keep_aspect_ratio", false).toBool());
+    ui->doNotEnlarge_CheckBox->setChecked(QSettings().value("compression_options/resize/do_not_enlarge", false).toBool());
 
-    ui->fitTo_ComboBox->setCurrentIndex(settings.value("compression_options/resize/fit_to", 0).toInt());
-    ui->width_SpinBox->setValue(settings.value("compression_options/resize/width", 1000).toInt());
-    ui->height_SpinBox->setValue(settings.value("compression_options/resize/height", 1000).toInt());
-    ui->edge_SpinBox->setValue(settings.value("compression_options/resize/size", 1000).toInt());
-    ui->keepAspectRatio_CheckBox->setChecked(settings.value("compression_options/resize/keep_aspect_ratio", false).toBool());
-    ui->doNotEnlarge_CheckBox->setChecked(settings.value("compression_options/resize/do_not_enlarge", false).toBool());
+    ui->outputFolder_LineEdit->setText(QSettings().value("compression_options/output/output_folder", "").toString());
+    ui->outputSuffix_LineEdit->setText(QSettings().value("compression_options/output/output_suffix", "").toString());
+    ui->sameOutputFolderAsInput_CheckBox->setChecked(QSettings().value("compression_options/output/same_folder_as_input", false).toBool());
+    ui->skipIfBigger_CheckBox->setChecked(QSettings().value("compression_options/output/skip_if_bigger", true).toBool());
+    ui->keepDates_CheckBox->setCheckState(QSettings().value("compression_options/output/keep_dates", Qt::Unchecked).value<Qt::CheckState>());
+    ui->keepCreationDate_CheckBox->setChecked(QSettings().value("compression_options/output/keep_creation_date", false).toBool());
+    ui->keepLastModifiedDate_CheckBox->setChecked(QSettings().value("compression_options/output/keep_last_modified_date", false).toBool());
+    ui->keepLastAccessDate_CheckBox->setChecked(QSettings().value("compression_options/output/keep_last_access_date", false).toBool());
+    ui->format_ComboBox->setCurrentIndex(QSettings().value("compression_options/output/format", 0).toInt());
+    ui->moveOriginalFile_CheckBox->setChecked(QSettings().value("compression_options/output/move_original_file", QSettings().value("compression_options/output/move_original_to_trash", false).toBool()).toBool()); // Trying to get legacy value
+    ui->moveOriginalFile_ComboBox->setCurrentIndex(QSettings().value("compression_options/output/move_original_file_destination", 0).toInt());
 
-    ui->outputFolder_LineEdit->setText(settings.value("compression_options/output/output_folder", "").toString());
-    ui->outputSuffix_LineEdit->setText(settings.value("compression_options/output/output_suffix", "").toString());
-    ui->sameOutputFolderAsInput_CheckBox->setChecked(settings.value("compression_options/output/same_folder_as_input", false).toBool());
-    ui->skipIfBigger_CheckBox->setChecked(settings.value("compression_options/output/skip_if_bigger", true).toBool());
-    ui->keepDates_CheckBox->setCheckState(settings.value("compression_options/output/keep_dates", Qt::Unchecked).value<Qt::CheckState>());
-    ui->keepCreationDate_CheckBox->setChecked(settings.value("compression_options/output/keep_creation_date", false).toBool());
-    ui->keepLastModifiedDate_CheckBox->setChecked(settings.value("compression_options/output/keep_last_modified_date", false).toBool());
-    ui->keepLastAccessDate_CheckBox->setChecked(settings.value("compression_options/output/keep_last_access_date", false).toBool());
-    ui->format_ComboBox->setCurrentIndex(settings.value("compression_options/output/format", 0).toInt());
-
-    this->lastOpenedDirectory = settings.value("extra/last_opened_directory", QStandardPaths::standardLocations(QStandardPaths::PicturesLocation).at(0)).toString();
+    this->lastOpenedDirectory = QSettings().value("extra/last_opened_directory", QStandardPaths::standardLocations(QStandardPaths::PicturesLocation).at(0)).toString();
 }
 
-void MainWindow::previewImage(const QModelIndex& imageIndex, bool forceRuntimePreview)
+void MainWindow::previewImage(const QModelIndex& imageIndex, bool forceRuntimePreview) const
 {
     if (this->previewWatcher->isRunning()) {
         this->previewWatcher->cancel();
         this->previewWatcher->waitForFinished();
     }
-    QSettings settings;
-    if (!settings.value("mainwindow/previews_visible", false).toBool()) {
+    if (!QSettings().value("mainwindow/previews_visible", false).toBool()) {
         return;
     }
     ui->preview_GraphicsView->removePixmap();
@@ -389,7 +451,7 @@ void MainWindow::previewImage(const QModelIndex& imageIndex, bool forceRuntimePr
     images.append(std::pair<QString, bool>(cImage->getFullPath(), false));
 
     // TODO Manage failure better
-    std::function<ImagePreview(std::pair<QString, bool>)> loadPixmap = [this, forceRuntimePreview, cImage](std::pair<QString, bool> pair) {
+    std::function<ImagePreview(std::pair<QString, bool>)> loadPixmap = [this, forceRuntimePreview, cImage](const std::pair<QString, bool>& pair) {
         QString previewFullPath = pair.first;
         ImagePreview imagePreview;
         bool isOnFlyPreview = false;
@@ -400,7 +462,7 @@ void MainWindow::previewImage(const QModelIndex& imageIndex, bool forceRuntimePr
                 previewFullPath = cImage->getCompressedFullPath();
             }
         }
-        auto *imageReader = new QImageReader(previewFullPath);
+        auto* imageReader = new QImageReader(previewFullPath);
         imageReader->setAutoTransform(true);
         QPixmap image = QPixmap::fromImageReader(imageReader);
         imagePreview.image = image;
@@ -408,7 +470,7 @@ void MainWindow::previewImage(const QModelIndex& imageIndex, bool forceRuntimePr
         imagePreview.originalSize = cImage->getOriginalSize();
         imagePreview.isOnFlyPreview = isOnFlyPreview;
         imagePreview.format = QString(imageReader->format()).toUpper();
-        delete imageReader; //Or the file will be opened forever
+        delete imageReader; // Or the file will be opened forever
         return imagePreview;
     };
 
@@ -454,7 +516,7 @@ void MainWindow::updateFolderMap(QString baseFolder, int count)
 
 void MainWindow::importFiles(const QStringList& fileList, QString baseFolder)
 {
-    int listLength = (int)fileList.count();
+    int listLength = static_cast<int>(fileList.count());
     QProgressDialog progressDialog(tr("Importing files..."), tr("Cancel"), 0, listLength, this);
     progressDialog.setWindowModality(Qt::WindowModal);
 
@@ -469,17 +531,6 @@ void MainWindow::importFiles(const QStringList& fileList, QString baseFolder)
             if (this->cImageModel->contains(cImage)) {
                 continue;
             }
-            bool skipBySizeEnabled = QSettings().value("preferences/general/skip_by_size/enabled", false).toBool();
-            if (skipBySizeEnabled) {
-                //TODO Make it an Enum
-                int unit = QSettings().value("preferences/general/skip_by_size/unit", 0).toInt();
-                int condition = QSettings().value("preferences/general/skip_by_size/condition", 0).toInt();
-                int size = QSettings().value("preferences/general/skip_by_size/value", 0).toInt() << (unit * 10);
-                size_t imageSize = cImage->getOriginalSize();
-                if ((condition == 0 && imageSize > size) || (condition == 1 && imageSize == size) || (condition == 2 && imageSize < size)) {
-                    continue;
-                }
-            }
             list.append(cImage);
         } catch (ImageNotSupportedException& e) {
             qWarning() << fileList.at(i) << "is not supported. Error:" << e.what();
@@ -491,8 +542,8 @@ void MainWindow::importFiles(const QStringList& fileList, QString baseFolder)
     }
 
     if (!list.isEmpty() && listLength > 0) {
-        this->updateFolderMap(std::move(baseFolder), (int)list.count());
-        QString rootFolder = getRootFolder(this->folderMap.keys());
+        this->updateFolderMap(std::move(baseFolder), static_cast<int>(list.count()));
+        QString rootFolder = Importer::getRootFolder(this->folderMap.keys());
         this->cImageModel->appendItems(list, rootFolder);
         this->importedFilesRootFolder = rootFolder;
     }
@@ -533,35 +584,32 @@ void MainWindow::on_compress_Button_clicked()
     this->startCompression();
 }
 
-void MainWindow::startCompression()
+void MainWindow::startCompression(bool onlyFailed)
 {
-    QSettings settings;
 
     if (ui->outputFolder_LineEdit->text().isEmpty() && !ui->sameOutputFolderAsInput_CheckBox->isChecked()) {
         QCaesiumMessageBox msgBox;
-        msgBox.setText("Please select an output folder first");
-        msgBox.setStandardButtons(QMessageBox::Ok);
-        msgBox.setDefaultButton(QMessageBox::Ok);
+        msgBox.setText(tr("Please select an output folder first"));
+        msgBox.addButton(tr("Ok"), QMessageBox::AcceptRole);
         msgBox.exec();
         return;
     }
 
-    QString rootFolder = getRootFolder(this->folderMap.keys());
+    QString rootFolder = Importer::getRootFolder(this->folderMap.keys());
 
+    bool skipDialogs = QSettings().value("preferences/general/skip_compression_dialogs").toBool();
     bool overwriteWarningFlag = (ui->sameOutputFolderAsInput_CheckBox->isChecked() && ui->outputSuffix_LineEdit->text().isEmpty())
         || rootFolder == ui->outputFolder_LineEdit->text();
 
-    if (overwriteWarningFlag) {
+    if (overwriteWarningFlag && !skipDialogs) {
         QCaesiumMessageBox sameFolderPrompt;
         sameFolderPrompt.setText(tr("You are about to overwrite your original images and this action can't be undone.\n\nDo you really want to continue?"));
-        sameFolderPrompt.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+        sameFolderPrompt.addButton(tr("Yes"), QMessageBox::YesRole);
+        auto noButton = sameFolderPrompt.addButton(tr("No"), QMessageBox::NoRole);
 
-        sameFolderPrompt.setButtonText(QMessageBox::Yes, tr("Yes"));
-        sameFolderPrompt.setButtonText(QMessageBox::No, tr("No"));
+        sameFolderPrompt.exec();
 
-        int answer = sameFolderPrompt.exec();
-
-        if (answer == QMessageBox::No) {
+        if (sameFolderPrompt.clickedButton() == noButton) {
             return;
         }
     }
@@ -571,11 +619,13 @@ void MainWindow::startCompression()
         return;
     }
 
-    if (!settings.value("preferences/general/multithreading", true).toBool()) {
+    if (!QSettings().value("preferences/general/multithreading", true).toBool()) {
         QThreadPool::globalInstance()->setMaxThreadCount(1);
     } else {
-        QThreadPool::globalInstance()->setMaxThreadCount(QThread::idealThreadCount());
+        int maxThreads = QSettings().value("preferences/general/multithreading_max_threads", QThread::idealThreadCount()).toInt();
+        QThreadPool::globalInstance()->setMaxThreadCount(maxThreads);
     }
+    QThreadPool::globalInstance()->setThreadPriority(QSettings().value("preferences/general/threads_priority", QThread::NormalPriority).value<QThread::Priority>());
 
     this->compressionWatcher = new QFutureWatcher<void>();
     connect(this->compressionWatcher, &QFutureWatcherBase::finished, this, &MainWindow::compressionFinished);
@@ -595,7 +645,12 @@ void MainWindow::startCompression()
 
     CompressionOptions compressionOptions = this->getCompressionOptions(rootFolder);
 
-    this->compressionWatcher->setFuture(this->cImageModel->getRootItem()->compress(compressionOptions));
+    if (onlyFailed) {
+        this->compressionWatcher->setFuture(this->cImageModel->getRootItem()->compressOnlyFailed(compressionOptions));
+    } else {
+        this->compressionWatcher->setFuture(this->cImageModel->getRootItem()->compress(compressionOptions));
+    }
+
     compressionSummary.totalImages = this->cImageModel->rowCount();
     compressionSummary.totalUncompressedSize = this->cImageModel->originalItemsSize();
     compressionSummary.totalCompressedSize = 0;
@@ -606,12 +661,17 @@ void MainWindow::startCompression()
     compressionTimer.start();
 }
 
-CompressionOptions MainWindow::getCompressionOptions(QString rootFolder)
+CompressionOptions MainWindow::getCompressionOptions(const QString& rootFolder) const
 {
     FileDatesOutputOption datesMap = {
         ui->keepCreationDate_CheckBox->isChecked(),
         ui->keepLastModifiedDate_CheckBox->isChecked(),
         ui->keepLastAccessDate_CheckBox->isChecked()
+    };
+
+    MaxOutputSize maxOutputSize {
+        static_cast<MaxOutputSizeUnit>(ui->maxOutputSizeUnit_ComboBox->currentIndex()),
+        static_cast<size_t>(ui->maxOutputSize_SpinBox->value())
     };
 
     CompressionOptions compressionOptions = {
@@ -630,11 +690,20 @@ CompressionOptions MainWindow::getCompressionOptions(QString rootFolder)
         ui->doNotEnlarge_CheckBox->isChecked(),
         ui->sameOutputFolderAsInput_CheckBox->isChecked(),
         ui->skipIfBigger_CheckBox->isChecked(),
+        ui->moveOriginalFile_CheckBox->isChecked(),
+        ui->moveOriginalFile_ComboBox->currentIndex(),
         qBound(ui->JPEGQuality_Slider->value(), 1, 100),
+        ui->JPEGChromaSubsampling_ComboBox->currentData(Qt::UserRole).toInt(),
+        ui->JPEGProgressive_CheckBox->isChecked(),
         qBound(ui->PNGQuality_Slider->value(), 0, 100),
+        qBound(ui->PNGOptimizationLevel_Slider->value(), 1, 6),
         qBound(ui->WebPQuality_Slider->value(), 1, 100),
+        ui->TIFFCompressionMethod_ComboBox->currentIndex(),
+        qBound(ui->TIFFDeflateLevel_Slider->value() * 3, 1, 9),
         ui->keepDates_CheckBox->checkState() != Qt::Unchecked,
-        datesMap
+        datesMap,
+        static_cast<CompressionMode>(ui->compressionMode_ComboBox->currentIndex()),
+        maxOutputSize,
     };
 
     return compressionOptions;
@@ -652,25 +721,23 @@ void MainWindow::on_removeFiles_Button_clicked()
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
-    QSettings settings;
-    if (settings.value("preferences/general/prompt_before_exit", false).toBool()) {
+    if (QSettings().value("preferences/general/prompt_before_exit", false).toBool()) {
         QCaesiumMessageBox exitPrompt;
         exitPrompt.setText(tr("Do you really want to quit?"));
-        exitPrompt.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
 
-        exitPrompt.setButtonText(QMessageBox::Yes, tr("Yes"));
-        exitPrompt.setButtonText(QMessageBox::No, tr("Cancel"));
+        exitPrompt.addButton(tr("Yes"), QMessageBox::YesRole);
+        auto rejectButton = exitPrompt.addButton(tr("Cancel"), QMessageBox::RejectRole);
 
-        int answer = exitPrompt.exec();
+        exitPrompt.exec();
 
-        if (answer == QMessageBox::No) {
+        if (exitPrompt.clickedButton() == rejectButton) {
             event->ignore();
             return;
         }
     }
 
     this->writeSettings();
-    this->clearCache();
+    MainWindow::clearCache();
     this->previewWatcher->waitForFinished();
     qInfo() << "---- Closing application ----";
     Logger::closeLogFile();
@@ -687,13 +754,13 @@ void MainWindow::on_outputFolderBrowse_Button_clicked()
     if (!directoryPath.isEmpty()) {
         ui->outputFolder_LineEdit->setText(directoryPath);
 
-        this->writeSetting("compression_options/output/output_folder", directoryPath);
+        QSettings().setValue("compression_options/output/output_folder", directoryPath);
     }
 }
 
 void MainWindow::on_outputSuffix_LineEdit_textChanged(const QString& arg1)
 {
-    this->writeSetting("compression_options/output/output_suffix", arg1);
+    QSettings().setValue("compression_options/output/output_suffix", arg1);
 }
 
 void MainWindow::imageList_selectionChanged()
@@ -730,7 +797,6 @@ void MainWindow::imageList_selectionChanged()
 void MainWindow::compressionFinished()
 {
     this->cImageModel->getRootItem()->setCompressionCanceled(false);
-    QSettings settings;
     if (ui->imageList_TreeView->selectionModel()->selectedRows().count() > 0) {
         this->previewImage(this->proxyModel->mapToSource(ui->imageList_TreeView->selectionModel()->selectedRows().at(0)));
     }
@@ -738,7 +804,7 @@ void MainWindow::compressionFinished()
     compressionSummary.totalCompressedSize = this->cImageModel->compressedItemsSize();
     compressionSummary.elapsedTime = compressionTimer.isValid() ? compressionTimer.elapsed() : 0;
 
-    if (settings.value("preferences/general/send_usage_reports", true).toBool()) {
+    if (QSettings().value("preferences/general/send_usage_reports", true).toBool()) {
         this->networkOperations->sendUsageReport(compressionSummary);
     }
 
@@ -750,23 +816,31 @@ void MainWindow::compressionFinished()
     QString title = tr("Compression finished!");
     QString saved = toHumanSize(compressionSummary.totalUncompressedSize - compressionSummary.totalCompressedSize);
     QString savedPerc = QString::number(round((compressionSummary.totalUncompressedSize - compressionSummary.totalCompressedSize) / compressionSummary.totalUncompressedSize * 100));
-    this->trayIcon->showMessage(title, tr("You just saved %1!").arg(saved), QSystemTrayIcon::NoIcon);
 
     ui->cancelCompression_Button->hide();
     ui->compression_ProgressBar->hide();
     ui->compressionProgress_Label->hide();
     this->toggleUIEnabled(true);
 
-    QCaesiumMessageBox compressionSummaryDialog;
-    compressionSummaryDialog.setText(title);
-    compressionSummaryDialog.setInformativeText(tr("Total files: %1\nOriginal size: %2\nCompressed size: %3\nSaved: %4 (%5%)")
-                                                    .arg(QString::number(compressionSummary.totalImages),
-                                                        toHumanSize(compressionSummary.totalUncompressedSize),
-                                                        toHumanSize(compressionSummary.totalCompressedSize),
-                                                        saved,
-                                                        savedPerc));
-    compressionSummaryDialog.setStandardButtons(QMessageBox::Ok);
-    compressionSummaryDialog.exec();
+    PostCompressionAction postCompressionAction = static_cast<PostCompressionAction>(QSettings().value("preferences/general/post_compression_action", 0).toInt());
+    if (postCompressionAction != PostCompressionAction::NO_ACTION) {
+        PostCompressionActions::runAction(postCompressionAction, ui->outputFolder_LineEdit->text());
+        return;
+    }
+
+    this->trayIcon->showMessage(title, tr("You just saved %1!").arg(saved), QSystemTrayIcon::NoIcon);
+    if (!QSettings().value("preferences/general/skip_compression_dialogs").toBool()) {
+        QCaesiumMessageBox compressionSummaryDialog;
+        compressionSummaryDialog.setText(title);
+        compressionSummaryDialog.setInformativeText(tr("Total files: %1\nOriginal size: %2\nCompressed size: %3\nSaved: %4 (%5%)")
+                .arg(QString::number(compressionSummary.totalImages),
+                    toHumanSize(compressionSummary.totalUncompressedSize),
+                    toHumanSize(compressionSummary.totalCompressedSize),
+                    saved,
+                    savedPerc));
+        compressionSummaryDialog.addButton(tr("Ok"), QMessageBox::AcceptRole);
+        compressionSummaryDialog.exec();
+    }
 }
 
 void MainWindow::on_actionRemove_triggered()
@@ -779,22 +853,21 @@ void MainWindow::on_actionClear_triggered()
     this->removeFiles(true);
 }
 
-void MainWindow::dropFinished(QStringList filePaths)
+void MainWindow::dropFinished(const QStringList& filePaths)
 {
-    QString baseFolder = getRootFolder(filePaths);
+    QString baseFolder = Importer::getRootFolder(filePaths);
     this->importFiles(filePaths, baseFolder);
 }
 
-void MainWindow::on_fitTo_ComboBox_currentIndexChanged(int index)
+void MainWindow::on_fitTo_ComboBox_currentIndexChanged(int index) const
 {
-    QSettings settings;
     switch (index) {
     default:
     case ResizeMode::NO_RESIZE:
-        ui->resize_Frame->setDisabled(true);
+        ui->resize_Frame->setHidden(true);
         break;
     case ResizeMode::DIMENSIONS:
-        ui->resize_Frame->setDisabled(false);
+        ui->resize_Frame->setHidden(false);
         ui->edge_Label->hide();
         ui->edge_SpinBox->hide();
         ui->width_Label->show();
@@ -808,22 +881,22 @@ void MainWindow::on_fitTo_ComboBox_currentIndexChanged(int index)
         ui->keepAspectRatio_CheckBox->setDisabled(true);
         break;
     case ResizeMode::PERCENTAGE:
-        ui->resize_Frame->setDisabled(false);
+        ui->resize_Frame->setHidden(false);
         ui->edge_Label->hide();
         ui->edge_SpinBox->hide();
         ui->width_Label->show();
         ui->width_SpinBox->show();
         ui->width_SpinBox->setSuffix(tr("%"));
-        ui->width_SpinBox->setMaximum(ui->keepAspectRatio_CheckBox->isChecked() ? 100 : 999);
+        ui->width_SpinBox->setMaximum(ui->doNotEnlarge_CheckBox->isChecked() ? 100 : 999);
         ui->height_Label->show();
         ui->height_SpinBox->show();
         ui->height_SpinBox->setSuffix(tr("%"));
-        ui->height_SpinBox->setMaximum(ui->keepAspectRatio_CheckBox->isChecked() ? 100 : 999);
+        ui->height_SpinBox->setMaximum(ui->doNotEnlarge_CheckBox->isChecked() ? 100 : 999);
         ui->keepAspectRatio_CheckBox->setEnabled(true);
         break;
     case ResizeMode::SHORT_EDGE:
     case ResizeMode::LONG_EDGE:
-        ui->resize_Frame->setDisabled(false);
+        ui->resize_Frame->setHidden(false);
         ui->edge_Label->show();
         ui->edge_SpinBox->show();
         ui->width_Label->hide();
@@ -832,43 +905,64 @@ void MainWindow::on_fitTo_ComboBox_currentIndexChanged(int index)
         ui->height_SpinBox->hide();
         ui->keepAspectRatio_CheckBox->setDisabled(true);
         break;
+    case ResizeMode::FIXED_WIDTH:
+        ui->resize_Frame->setHidden(false);
+        ui->edge_Label->hide();
+        ui->edge_SpinBox->hide();
+        ui->width_Label->show();
+        ui->width_SpinBox->show();
+        ui->width_SpinBox->setSuffix(tr("px"));
+        ui->height_Label->hide();
+        ui->height_SpinBox->hide();
+        ui->height_SpinBox->setSuffix(tr("px"));
+        ui->keepAspectRatio_CheckBox->setEnabled(false);
+        break;
+    case ResizeMode::FIXED_HEIGHT:
+        ui->resize_Frame->setHidden(false);
+        ui->edge_Label->hide();
+        ui->edge_SpinBox->hide();
+        ui->width_Label->hide();
+        ui->width_SpinBox->hide();
+        ui->width_SpinBox->setSuffix(tr("px"));
+        ui->height_Label->show();
+        ui->height_SpinBox->show();
+        ui->height_SpinBox->setSuffix(tr("px"));
+        ui->keepAspectRatio_CheckBox->setEnabled(false);
+        break;
     }
 
-    this->writeSetting("compression_options/resize/fit_to", index);
+    QSettings().setValue("compression_options/resize/fit_to", index);
+    this->toggleLosslessWarningVisible();
 }
 
-void MainWindow::on_width_SpinBox_valueChanged(int value)
+void MainWindow::on_width_SpinBox_valueChanged(int value) const
 {
     if (ui->fitTo_ComboBox->currentIndex() == ResizeMode::PERCENTAGE && ui->keepAspectRatio_CheckBox->isChecked()) {
         ui->height_SpinBox->setValue(value);
     }
-    this->writeSetting("compression_options/resize/width", value);
-    this->writeSetting("compression_options/resize/height", ui->height_SpinBox->value());
 }
 
-void MainWindow::on_height_SpinBox_valueChanged(int value)
+void MainWindow::on_height_SpinBox_valueChanged(int value) const
 {
     if (ui->fitTo_ComboBox->currentIndex() == ResizeMode::PERCENTAGE && ui->keepAspectRatio_CheckBox->isChecked()) {
         ui->width_SpinBox->setValue(value);
     }
-    this->writeSetting("compression_options/resize/height", value);
-    this->writeSetting("compression_options/resize/width", ui->width_SpinBox->value());
 }
 
 void MainWindow::on_edge_SpinBox_valueChanged(int value)
 {
-    this->writeSetting("compression_options/resize/size", value);
+    QSettings().setValue("compression_options/resize/size", value);
 }
 
-void MainWindow::on_keepAspectRatio_CheckBox_toggled(bool checked)
+void MainWindow::on_keepAspectRatio_CheckBox_toggled(bool checked) const
 {
     if (ui->fitTo_ComboBox->currentIndex() == ResizeMode::PERCENTAGE && checked) {
         ui->height_SpinBox->setValue(ui->width_SpinBox->value());
     }
-    this->writeSetting("compression_options/resize/keep_aspect_ratio", checked);
+    QSettings().setValue("compression_options/resize/keep_aspect_ratio", checked);
 }
 
-void MainWindow::on_doNotEnlarge_CheckBox_toggled(bool checked)
+void MainWindow::on_doNotEnlarge_CheckBox_toggled(bool checked) const
 {
     if (ui->fitTo_ComboBox->currentIndex() == ResizeMode::PERCENTAGE && checked) {
         ui->width_SpinBox->setMaximum(100);
@@ -878,55 +972,81 @@ void MainWindow::on_doNotEnlarge_CheckBox_toggled(bool checked)
         ui->width_SpinBox->setMaximum(maximum);
         ui->height_SpinBox->setMaximum(maximum);
     }
-    this->writeSetting("compression_options/resize/do_not_enlarge", checked);
+    QSettings().setValue("compression_options/resize/do_not_enlarge", checked);
 }
 
-void MainWindow::on_actionSelect_All_triggered()
+void MainWindow::on_actionSelect_All_triggered() const
 {
     ui->imageList_TreeView->selectAll();
 }
 
 void MainWindow::on_sameOutputFolderAsInput_CheckBox_toggled(bool checked)
 {
-    this->writeSetting("compression_options/output/same_folder_as_input", checked);
+    QSettings().setValue("compression_options/output/same_folder_as_input", checked);
 }
 
 void MainWindow::on_keepStructure_CheckBox_toggled(bool checked)
 {
-    this->writeSetting("compression_options/compression/keep_structure", checked);
+    QSettings().setValue("compression_options/compression/keep_structure", checked);
 }
 
-void MainWindow::on_lossless_CheckBox_toggled(bool checked)
+void MainWindow::on_lossless_CheckBox_toggled(bool checked) const
 {
-    this->writeSetting("compression_options/compression/lossless", checked);
+    QSettings().setValue("compression_options/compression/lossless", checked);
+
+    ui->JPEGOptions_Frame->setEnabled(!checked);
+    ui->WebPOptions_Frame->setEnabled(!checked);
+
+    ui->PNGQuality_Label->setEnabled(!checked);
+    ui->PNGQuality_SpinBox->setEnabled(!checked);
+    ui->PNGQuality_Slider->setEnabled(!checked);
+    ui->PNGOptimizationLevel_Label->setEnabled(checked);
+    ui->PNGOptimizationLevel_SpinBox->setEnabled(checked);
+    ui->PNGOptimizationLevel_Slider->setEnabled(checked);
+
+    this->toggleLosslessWarningVisible();
 }
 
 void MainWindow::on_keepMetadata_CheckBox_toggled(bool checked)
 {
-    this->writeSetting("compression_options/compression/keep_metadata", checked);
+    QSettings().setValue("compression_options/compression/keep_metadata", checked);
 }
 
-void MainWindow::on_JPEGQuality_Slider_valueChanged(int value)
+void MainWindow::onJPEGQualityValueChanged(int value) const
 {
-    this->writeSetting("compression_options/compression/jpeg_quality", value);
+    if (ui->JPEGQuality_Slider->value() != value) {
+        ui->JPEGQuality_Slider->setValue(value);
+    }
+
+    if (ui->JPEGQuality_SpinBox->value() != value) {
+        ui->JPEGQuality_SpinBox->setValue(value);
+    }
+    QSettings().setValue("compression_options/compression/jpeg_quality", value);
 }
 
-void MainWindow::on_JPEGQuality_SpinBox_valueChanged(int value)
+void MainWindow::onPNGQualityValueChanged(int value) const
 {
-    this->writeSetting("compression_options/compression/jpeg_quality", value);
+    if (ui->PNGQuality_SpinBox->value() != value) {
+        ui->PNGQuality_SpinBox->setValue(value);
+    }
+    if (ui->PNGQuality_Slider->value() != value) {
+        ui->PNGQuality_Slider->setValue(value);
+    }
+    QSettings().setValue("compression_options/compression/png_quality", value);
 }
 
-void MainWindow::on_PNGQuality_Slider_valueChanged(int value)
+void MainWindow::onWebPQualityValueChanged(int value) const
 {
-    this->writeSetting("compression_options/compression/png_quality", value);
+    if (ui->WebPQuality_SpinBox->value() != value) {
+        ui->WebPQuality_SpinBox->setValue(value);
+    }
+    if (ui->WebPQuality_Slider->value() != value) {
+        ui->WebPQuality_Slider->setValue(value);
+    }
+    QSettings().setValue("compression_options/compression/webp_quality", value);
 }
 
-void MainWindow::on_PNGQuality_SpinBox_valueChanged(int value)
-{
-    this->writeSetting("compression_options/compression/png_quality", value);
-}
-
-void MainWindow::cModelItemsChanged()
+void MainWindow::cModelItemsChanged() const
 {
     int itemsCount = this->cImageModel->rowCount();
     QString humanItemsCount = QString::number(itemsCount);
@@ -946,51 +1066,42 @@ void MainWindow::cModelItemsChanged()
 
 void MainWindow::initUpdater()
 {
-    QSettings settings;
-    bool isPortable = false;
-#ifdef IS_PORTABLE
-    isPortable = true;
-#endif
+
 #ifdef Q_OS_MAC
     CocoaInitializer initializer;
     auto updater = new SparkleAutoUpdater("https://saerasoft.com/repository/com.saerasoft.caesium/osx/appcast.xml");
-    updater->setCheckForUpdatesAutomatically(settings.value("preferences/general/check_updates_at_startup", false).toBool());
-    if (settings.value("preferences/general/check_updates_at_startup", false).toBool()) {
+    updater->setCheckForUpdatesAutomatically(QSettings().value("preferences/general/check_updates_at_startup", true).toBool());
+    if (QSettings().value("preferences/general/check_updates_at_startup", true).toBool()) {
         updater->checkForUpdates();
     }
 #endif
 
-#ifdef Q_OS_WIN
-    if (isPortable) {
-        return;
-    }
-
-    QString locale = LanguageManager::getLocaleFromPreferences(settings.value("preferences/language/locale", "default"));
+#if defined(Q_OS_WIN) && !defined(IS_PORTABLE)
+    QString locale = LanguageManager::getLocaleFromPreferences(QSettings().value("preferences/language/locale", "default"));
     if (locale != "default") {
         win_sparkle_set_lang(locale.replace('_', '-').toUtf8().constData());
     }
     win_sparkle_set_appcast_url("https://saerasoft.com/repository/com.saerasoft.caesium/win/appcast.xml");
     win_sparkle_init();
 
-    if (settings.value("preferences/general/check_updates_at_startup", false).toBool()) {
+    if (QSettings().value("preferences/general/check_updates_at_startup", true).toBool()) {
         win_sparkle_check_update_without_ui();
     }
 
 #endif
 }
 
-void MainWindow::on_actionShow_previews_toggled(bool toggled)
+void MainWindow::on_actionShow_previews_toggled(bool toggled) const
 {
     ui->main_VSplitter->setChildrenCollapsible(!toggled);
     ui->main_VSplitter->handle(1)->setEnabled(toggled);
-    this->writeSetting("mainwindow/previews_visible", toggled);
+    QSettings().setValue("mainwindow/previews_visible", toggled);
 
     if (!toggled) {
-        this->writeSetting("mainwindow/main_splitter_sizes", QVariant::fromValue<QList<int>>(ui->main_VSplitter->sizes()));
+        QSettings().setValue("mainwindow/main_splitter_sizes", QVariant::fromValue<QList<int>>(ui->main_VSplitter->sizes()));
         ui->main_VSplitter->setSizes(QList<int>({ 500, 0 }));
     } else {
-        QSettings settings;
-        ui->main_VSplitter->setSizes(settings.value("mainwindow/main_splitter_sizes", QVariant::fromValue<QList<int>>({ 500, 250 })).value<QList<int>>());
+        ui->main_VSplitter->setSizes(QSettings().value("mainwindow/main_splitter_sizes", QVariant::fromValue<QList<int>>({ 500, 250 })).value<QList<int>>());
         if (this->selectedCount == 1) {
             bool autoPreview = QSettings().value("mainwindow/auto_preview", false).toBool();
             this->previewImage(this->proxyModel->mapToSource(this->selectedIndexes.at(0)), autoPreview);
@@ -998,7 +1109,7 @@ void MainWindow::on_actionShow_previews_toggled(bool toggled)
     }
 }
 
-void MainWindow::showListContextMenu(const QPoint& pos)
+void MainWindow::showListContextMenu(const QPoint& pos) const
 {
     this->listContextMenu->exec(ui->imageList_TreeView->viewport()->mapToGlobal(pos));
 }
@@ -1011,10 +1122,10 @@ void MainWindow::on_actionPreferences_triggered()
     preferencesDialog->show();
 }
 
-void MainWindow::keepDatesButtonGroupClicked()
+void MainWindow::keepDatesButtonGroupClicked() const
 {
     int checkedCount = 0;
-    int totalButtons = (int)this->keepDatesButtonGroup->buttons().count();
+    int totalButtons = static_cast<int>(this->keepDatesButtonGroup->buttons().count());
     Qt::CheckState mainCheckboxState = Qt::PartiallyChecked;
     foreach (QAbstractButton* button, this->keepDatesButtonGroup->buttons()) {
         checkedCount += button->isChecked() ? 1 : 0;
@@ -1028,12 +1139,12 @@ void MainWindow::keepDatesButtonGroupClicked()
 
     ui->keepDates_CheckBox->setCheckState(mainCheckboxState);
 
-    this->writeSetting("compression_options/output/keep_creation_date", ui->keepCreationDate_CheckBox->isChecked());
-    this->writeSetting("compression_options/output/keep_last_modified_date", ui->keepLastModifiedDate_CheckBox->isChecked());
-    this->writeSetting("compression_options/output/keep_last_access_date", ui->keepLastAccessDate_CheckBox->isChecked());
+    QSettings().setValue("compression_options/output/keep_creation_date", ui->keepCreationDate_CheckBox->isChecked());
+    QSettings().setValue("compression_options/output/keep_last_modified_date", ui->keepLastModifiedDate_CheckBox->isChecked());
+    QSettings().setValue("compression_options/output/keep_last_access_date", ui->keepLastAccessDate_CheckBox->isChecked());
 }
 
-void MainWindow::on_keepDates_CheckBox_clicked()
+void MainWindow::on_keepDates_CheckBox_clicked() const
 {
     if (ui->keepDates_CheckBox->checkState() == Qt::PartiallyChecked) {
         return;
@@ -1044,17 +1155,17 @@ void MainWindow::on_keepDates_CheckBox_clicked()
         button->setChecked(mainChecked);
     }
 
-    this->writeSetting("compression_options/output/keep_creation_date", ui->keepCreationDate_CheckBox->isChecked());
-    this->writeSetting("compression_options/output/keep_last_modified_date", ui->keepLastModifiedDate_CheckBox->isChecked());
-    this->writeSetting("compression_options/output/keep_last_access_date", ui->keepLastAccessDate_CheckBox->isChecked());
+    QSettings().setValue("compression_options/output/keep_creation_date", ui->keepCreationDate_CheckBox->isChecked());
+    QSettings().setValue("compression_options/output/keep_last_modified_date", ui->keepLastModifiedDate_CheckBox->isChecked());
+    QSettings().setValue("compression_options/output/keep_last_access_date", ui->keepLastAccessDate_CheckBox->isChecked());
 }
 
 void MainWindow::on_keepDates_CheckBox_stateChanged(int state)
 {
-    this->writeSetting("compression_options/output/keep_dates", state);
+    QSettings().setValue("compression_options/output/keep_dates", state);
 }
 
-void MainWindow::on_actionShow_original_in_file_manager_triggered()
+void MainWindow::on_actionShow_original_in_file_manager_triggered() const
 {
     if (this->selectedCount != 1) {
         return;
@@ -1065,7 +1176,7 @@ void MainWindow::on_actionShow_original_in_file_manager_triggered()
     showFileInNativeFileManager(cImage->getFullPath(), cImage->getDirectory());
 }
 
-void MainWindow::on_actionShow_compressed_in_file_manager_triggered()
+void MainWindow::on_actionShow_compressed_in_file_manager_triggered() const
 {
     if (this->selectedCount != 1) {
         return;
@@ -1079,7 +1190,7 @@ void MainWindow::on_actionShow_compressed_in_file_manager_triggered()
     showFileInNativeFileManager(cImage->getCompressedFullPath(), cImage->getCompressedDirectory());
 }
 
-void MainWindow::listContextMenuAboutToShow()
+void MainWindow::listContextMenuAboutToShow() const
 {
     if (this->selectedCount < 1) {
         return;
@@ -1090,34 +1201,41 @@ void MainWindow::listContextMenuAboutToShow()
     ui->actionShow_compressed_in_file_manager->setDisabled(cImage->getCompressedFullPath().isEmpty());
 }
 
-void MainWindow::showPreview(int index)
+void MainWindow::showPreview(int index) const
 {
     ImagePreview imagePreview = previewWatcher->resultAt(index);
     if (index == 0) {
         ui->preview_GraphicsView->setLoading(false);
         ui->originalImageSize_Label->setLoading(false);
         ui->preview_GraphicsView->showPixmap(imagePreview.image);
-        ui->originalImageSize_Label->setText(QString("%1 %2").arg(toHumanSize((double)imagePreview.fileInfo.size()), imagePreview.format));
         ui->preview_GraphicsView->fitInView(ui->preview_GraphicsView->scene()->itemsBoundingRect(), Qt::KeepAspectRatio);
         ui->preview_GraphicsView->show();
+        if (imagePreview.fileInfo.exists()) {
+            ui->originalImageSize_Label->setText(QString("%1 %2").arg(toHumanSize(static_cast<double>(imagePreview.fileInfo.size())), imagePreview.format));
+        } else {
+            ui->originalImageSize_Label->setText(tr("File not found"));
+        }
     }
 
     if (index == 1) {
-        auto originalSize = (double)imagePreview.originalSize;
-        auto currentSize = (double)imagePreview.fileInfo.size();
-        QString icon = "=";
-        QString color = "#14b8a6";
-        if (currentSize < originalSize) {
-            icon = "↓";
-            color = "#22c55e";
-        } else if (currentSize > originalSize) {
-            icon = "↑";
-            color = "#ef4444";
-        }
-        QString ratio = QString::number(round(-100 + (currentSize / originalSize * 100))) + "%";
-        QString labelTextPrefix = QString("<span style=\" color:%1;\">%2</span> %3 (%4) %5").arg(color, icon, toHumanSize(currentSize), ratio, imagePreview.format);
-        if (imagePreview.isOnFlyPreview) {
-            labelTextPrefix += " (" + tr("Preview") + ")";
+        QString labelTextPrefix = tr("File not found");
+        if (imagePreview.fileInfo.exists()) {
+            auto originalSize = static_cast<double>(imagePreview.originalSize);
+            auto currentSize = static_cast<double>(imagePreview.fileInfo.size());
+            QString icon = "=";
+            QString color = "#14b8a6";
+            if (currentSize < originalSize) {
+                icon = "↓";
+                color = "#22c55e";
+            } else if (currentSize > originalSize) {
+                icon = "↑";
+                color = "#ef4444";
+            }
+            QString ratio = QString::number(round(-100 + (currentSize / originalSize * 100))) + "%";
+            labelTextPrefix = QString("<span style=\" color:%1;\">%2</span> %3 (%4) %5").arg(color, icon, toHumanSize(currentSize), ratio, imagePreview.format);
+            if (imagePreview.isOnFlyPreview) {
+                labelTextPrefix += " (" + tr("Preview") + ")";
+            }
         }
         ui->previewCompressed_GraphicsView->setLoading(false);
         ui->compressedImageSize_Label->setLoading(false);
@@ -1127,7 +1245,7 @@ void MainWindow::showPreview(int index)
         ui->previewCompressed_GraphicsView->show();
     }
 }
-void MainWindow::compressionCanceled()
+void MainWindow::compressionCanceled() const
 {
     qInfo() << "Compression canceled by user.";
     ui->cancelCompression_Button->setEnabled(false);
@@ -1141,8 +1259,8 @@ void MainWindow::compressionCanceled()
 
 void MainWindow::listSortChanged(int logicalIndex, Qt::SortOrder order)
 {
-    this->writeSetting("mainwindow/list_view/sort_column_index", logicalIndex);
-    this->writeSetting("mainwindow/list_view/sort_column_order", order);
+    QSettings().setValue("mainwindow/list_view/sort_column_index", logicalIndex);
+    QSettings().setValue("mainwindow/list_view/sort_column_order", order);
 }
 
 void MainWindow::on_actionCompress_triggered()
@@ -1155,7 +1273,7 @@ void MainWindow::on_actionDonate_triggered()
     QDesktopServices::openUrl(QUrl("https://saerasoft.com/caesium/donate", QUrl::TolerantMode));
 }
 
-void MainWindow::on_actionToolbarIcons_only_triggered()
+void MainWindow::on_actionToolbarIcons_only_triggered() const
 {
     ui->actionToolbarIcons_and_Text->setChecked(false);
     ui->actionToolbarHide->setChecked(false);
@@ -1163,31 +1281,31 @@ void MainWindow::on_actionToolbarIcons_only_triggered()
     ui->toolBar->setVisible(true);
     ui->toolBar->setToolButtonStyle(Qt::ToolButtonIconOnly);
 
-    this->writeSetting("mainwindow/toolbar/visible", true);
-    this->writeSetting("mainwindow/toolbar/button_style", Qt::ToolButtonIconOnly);
+    QSettings().setValue("mainwindow/toolbar/visible", true);
+    QSettings().setValue("mainwindow/toolbar/button_style", Qt::ToolButtonIconOnly);
 }
 
-void MainWindow::on_actionToolbarIcons_and_Text_triggered()
+void MainWindow::on_actionToolbarIcons_and_Text_triggered() const
 {
     ui->actionToolbarIcons_only->setChecked(false);
     ui->actionToolbarHide->setChecked(false);
     ui->actionToolbarIcons_and_Text->setChecked(true);
     ui->toolBar->setVisible(true);
     ui->toolBar->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
-    this->writeSetting("mainwindow/toolbar/visible", true);
-    this->writeSetting("mainwindow/toolbar/button_style", Qt::ToolButtonTextUnderIcon);
+    QSettings().setValue("mainwindow/toolbar/visible", true);
+    QSettings().setValue("mainwindow/toolbar/button_style", Qt::ToolButtonTextUnderIcon);
 }
 
-void MainWindow::on_actionToolbarHide_triggered()
+void MainWindow::on_actionToolbarHide_triggered() const
 {
     ui->actionToolbarIcons_only->setChecked(false);
     ui->actionToolbarIcons_and_Text->setChecked(false);
     ui->actionToolbarHide->setChecked(true);
     ui->toolBar->setVisible(false);
-    this->writeSetting("mainwindow/toolbar/visible", false);
+    QSettings().setValue("mainwindow/toolbar/visible", false);
 }
 
-void MainWindow::toggleUIEnabled(bool enabled)
+void MainWindow::toggleUIEnabled(bool enabled) const
 {
     ui->toolBar->setEnabled(enabled);
     ui->parameters_TabWidget->setEnabled(enabled);
@@ -1196,17 +1314,17 @@ void MainWindow::toggleUIEnabled(bool enabled)
     ui->menuBar->setEnabled(enabled);
 }
 
-void MainWindow::updateCompressionProgressLabel(int value)
+void MainWindow::updateCompressionProgressLabel(int value) const
 {
     ui->compressionProgress_Label->setText(tr("Compressing...") + QString(" (%1/%2)").arg(QString::number(value), QString::number(ui->compression_ProgressBar->maximum())));
 }
 
 void MainWindow::on_actionAuto_preview_toggled(bool toggled)
 {
-    this->writeSetting("mainwindow/auto_preview", toggled);
+    QSettings().setValue("mainwindow/auto_preview", toggled);
 }
 
-void MainWindow::previewFinished()
+void MainWindow::previewFinished() const
 {
     ui->preview_GraphicsView->setZoomEnabled(true);
     ui->previewCompressed_GraphicsView->setZoomEnabled(true);
@@ -1225,7 +1343,7 @@ void MainWindow::clearCache()
     }
 }
 
-void MainWindow::previewCanceled()
+void MainWindow::previewCanceled() const
 {
     ui->preview_GraphicsView->setLoading(false);
     ui->originalImageSize_Label->setLoading(false);
@@ -1233,7 +1351,7 @@ void MainWindow::previewCanceled()
     ui->compressedImageSize_Label->setLoading(false);
 }
 
-void MainWindow::on_actionPreview_triggered()
+void MainWindow::on_actionPreview_triggered() const
 {
     if (this->selectedCount != 1) {
         return;
@@ -1250,36 +1368,183 @@ void MainWindow::on_actionPreview_triggered()
 
 void MainWindow::on_skipIfBigger_CheckBox_toggled(bool checked)
 {
-    this->writeSetting("compression_options/output/skip_if_bigger", checked);
+    QSettings().setValue("compression_options/output/skip_if_bigger", checked);
 }
 
-void MainWindow::outputFormatIndexChanged(int index)
+void MainWindow::outputFormatIndexChanged(int index) const
 {
-    this->writeSetting("compression_options/output/format", index);
+    QSettings().setValue("compression_options/output/format", index);
+    this->toggleLosslessWarningVisible();
 }
 
-void MainWindow::importFromArgs(const QStringList args)
+void MainWindow::importFromArgs(const QStringList& args)
 {
-    QStringList filesList;
-    QStringListIterator it(args);
-    //TODO Make a ENUM?
-    int argsBehaviour = QSettings().value("preferences/general/args_behaviour", 0).toInt();
-    while (it.hasNext()) {
-        QString path = it.next();
-        QFileInfo info = QFileInfo(path);
-        if (info.isDir()) {
-            bool scanSubfolders = QSettings().value("preferences/general/import_subfolders", true).toBool();
-            filesList.append(scanDirectory(path, scanSubfolders));
-        } else if (info.isFile()) {
-            filesList.append(path);
-        }
-    }
+    bool scanSubfolders = QSettings().value("preferences/general/import_subfolders", true).toBool();
+    QStringList filesList = Importer::scanList(args, scanSubfolders);
     if (filesList.isEmpty()) {
         return;
     }
-    QString baseFolder = getRootFolder(args);
+
+    ImportFromArgsMethod argsBehaviour = static_cast<ImportFromArgsMethod>(QSettings().value("preferences/general/args_behaviour", 0).toInt());
+    QString baseFolder = Importer::getRootFolder(args);
     this->importFiles(filesList, baseFolder);
-    if (argsBehaviour == 1) {
+    if (argsBehaviour == IMPORT_AND_COMPRESS) {
         this->startCompression();
     }
+}
+
+void MainWindow::moveOriginalFileToggled(bool checked) const
+{
+    ui->moveOriginalFile_ComboBox->setEnabled(checked);
+    QSettings().setValue("compression_options/output/move_original_file", checked);
+}
+
+void MainWindow::moveOriginalFileDestinationChanged(int index)
+{
+    QSettings().setValue("compression_options/output/move_original_file_destination", index);
+}
+
+void MainWindow::changeEvent(QEvent* event)
+{
+    if (event->type() == QEvent::LanguageChange) {
+        ui->retranslateUi(this);
+    }
+}
+
+QTranslator* MainWindow::getTranslator() const
+{
+    return translator;
+}
+
+void MainWindow::onMaxOutputSizeChanged(int value) const
+{
+    QSettings().setValue("compression_options/compression/max_output_size", ui->maxOutputSize_SpinBox->value());
+}
+
+void MainWindow::onMaxOutputSizeUnitChanged(int value) const
+{
+    if (value == MaxOutputSizeUnit::MAX_OUTPUT_PERCENTAGE && ui->maxOutputSize_SpinBox->value() > 100) {
+        ui->maxOutputSize_SpinBox->setValue(100);
+    }
+    QSettings().setValue("compression_options/compression/max_output_size_unit", ui->maxOutputSizeUnit_ComboBox->currentIndex());
+}
+
+void MainWindow::toggleLosslessWarningVisible() const
+{
+    bool showLosslessWarning = ui->lossless_CheckBox->isChecked()
+        && (ui->format_ComboBox->currentIndex() != 0 || ui->fitTo_ComboBox->currentIndex() != ResizeMode::NO_RESIZE)
+        && ui->compressionMode_ComboBox->currentIndex() == QUALITY;
+
+    ui->losslessWarning_Button->setVisible(showLosslessWarning);
+}
+
+void MainWindow::onCompressionModeChanged(int value) const
+{
+    QSettings().setValue("compression_options/compression/mode", ui->compressionMode_ComboBox->currentIndex());
+
+    this->toggleLosslessWarningVisible();
+}
+
+void MainWindow::onAdvancedImportTriggered()
+{
+    const auto advancedImportDialog = new AdvancedImportDialog();
+    connect(advancedImportDialog, &AdvancedImportDialog::importTriggered, [this](const QStringList& fileList) {
+        if (fileList.isEmpty()) {
+            return;
+        }
+        QString baseFolder = Importer::getRootFolder(fileList);
+        this->importFiles(fileList, baseFolder);
+    });
+
+    advancedImportDialog->exec();
+}
+
+void MainWindow::onPNGOptimizationLevelChanged(int value) const
+{
+    if (ui->PNGOptimizationLevel_SpinBox->value() != value) {
+        ui->PNGOptimizationLevel_SpinBox->setValue(value);
+    }
+    if (ui->PNGOptimizationLevel_Slider->value() != value) {
+        ui->PNGOptimizationLevel_Slider->setValue(value);
+    }
+
+    QSettings().setValue("compression_options/compression/png_optimization_level", value);
+}
+
+void MainWindow::onTIFFCompressionMethodChanged(int index) const
+{
+    ui->TIFFDeflateLevelContainer_Widget->setEnabled(index == 2);
+    QSettings().setValue("compression_options/compression/tiff_method", index);
+}
+
+void MainWindow::onTIFFDeflateLevelChanged(int value)
+{
+    QSettings().setValue("compression_options/compression/tiff_deflate_level", value);
+}
+
+void MainWindow::onJPEGChromaSubsamplingChanged() const
+{
+    QSettings().setValue("compression_options/compression/jpeg_chroma_subsampling", ui->JPEGChromaSubsampling_ComboBox->currentData(Qt::UserRole));
+}
+
+void MainWindow::setupChromaSubsamplingComboBox() const
+{
+    auto chromaSubsamplings = getChromaSubsamplingOptions();
+    auto iterator = QMapIterator<int, QString>(chromaSubsamplings);
+    while (iterator.hasNext()) {
+        auto chromaSubsamplingOption = iterator.next();
+        ui->JPEGChromaSubsampling_ComboBox->addItem(chromaSubsamplingOption.value(), chromaSubsamplingOption.key());
+    }
+}
+
+void MainWindow::setupCompressButton()
+{
+    auto recompressAction = new QAction(tr("Recompress failed"));
+    connect(recompressAction, &QAction::triggered, this, &MainWindow::recompressFailed);
+    this->ui->compress_Button->addAction(recompressAction);
+}
+
+void MainWindow::onJPEGOptionsVisibilityChanged(bool visible)
+{
+    QSettings().setValue("mainwindow/compression/jpeg_options_visible", visible);
+}
+void MainWindow::onPNGOptionsVisibilityChanged(bool visible)
+{
+    QSettings().setValue("mainwindow/compression/png_options_visible", visible);
+}
+void MainWindow::onWebPOptionsVisibilityChanged(bool visible)
+{
+    QSettings().setValue("mainwindow/compression/webp_options_visible", visible);
+}
+void MainWindow::onTIFFOptionsVisibilityChanged(bool visible)
+{
+    QSettings().setValue("mainwindow/compression/tiff_options_visible", visible);
+}
+void MainWindow::onJPEGProgressiveToggled(bool checked)
+{
+    QSettings().setValue("compression_options/compression/jpeg_progressive", checked);
+}
+
+void MainWindow::recompressFailed()
+{
+    this->startCompression(true);
+}
+
+void MainWindow::installCompressionOptionsEventFilter() const
+{
+    // TODO This is not super optimal, we should not disable scrolling on the widgets when we are not scrolling the ScrollArea
+    ui->JPEGQuality_Slider->installEventFilter(new QSliderScrollFilter());
+    ui->JPEGQuality_SpinBox->installEventFilter(new QSliderScrollFilter());
+    ui->JPEGChromaSubsampling_ComboBox->installEventFilter(new QSliderScrollFilter());
+
+    ui->PNGQuality_Slider->installEventFilter(new QSliderScrollFilter());
+    ui->PNGQuality_SpinBox->installEventFilter(new QSliderScrollFilter());
+    ui->PNGOptimizationLevel_Slider->installEventFilter(new QSliderScrollFilter());
+    ui->PNGOptimizationLevel_SpinBox->installEventFilter(new QSliderScrollFilter());
+
+    ui->WebPQuality_Slider->installEventFilter(new QSliderScrollFilter());
+    ui->WebPQuality_SpinBox->installEventFilter(new QSliderScrollFilter());
+
+    ui->TIFFDeflateLevel_Slider->installEventFilter(new QSliderScrollFilter());
+    ui->TIFFCompressionMethod_ComboBox->installEventFilter(new QSliderScrollFilter());
 }
