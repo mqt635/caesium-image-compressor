@@ -20,6 +20,8 @@ private slots:
 
 private:
     Ui::AboutDialog* ui;
+
+    void changeEvent(QEvent* event) override;
 };
 
 #endif // ABOUTDIALOG_H

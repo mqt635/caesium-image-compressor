@@ -3,7 +3,6 @@
 
 #include <QDesktopServices>
 #include <QDir>
-#include <QDirIterator>
 #include <QImageReader>
 #include <QJsonObject>
 #include <QMessageBox>
@@ -34,60 +33,25 @@ QString toHumanSize(double size)
         order = 4;
     }
 
-    return QString::number(size / (pow(1024, order)) * (isNegative ? -1 : 1), 'f', 2) + ' ' + unit[(int)order];
+    return QString::number(size / (pow(1024, order)) * (isNegative ? -1 : 1), 'f', 2) + ' ' + unit[static_cast<int>(order)];
 }
 
-// TODO Another thread?
-QStringList scanDirectory(const QString& directory, bool subfolders)
+std::tuple<unsigned int, unsigned int> cResize(const QImageReader* reader, const CompressionOptions& compressionOptions)
 {
-    QStringList inputFilterList = { "*.jpg", "*.jpeg", "*.png", "*.webp" };
-    QStringList fileList = {};
-    auto iteratorFlags = subfolders ? QDirIterator::Subdirectories : QDirIterator::NoIteratorFlags;
-    // Collecting all files in folder
-    if (QDir(directory).exists()) {
-        QDirIterator it(directory,
-            inputFilterList,
-            QDir::AllEntries,
-            iteratorFlags);
+    int fitTo = compressionOptions.fitTo;
+    int width = compressionOptions.width;
+    int height = compressionOptions.height;
+    int size = compressionOptions.size;
+    bool doNotEnlarge = compressionOptions.doNotEnlarge;
+    bool keepMetadata = compressionOptions.keepMetadata;
+    bool rotatedByMetadata = false;
 
-        while (it.hasNext()) {
-            it.next();
-            fileList.append(it.filePath());
-        }
+    QSize originalSize = reader->size();
+    if (keepMetadata && (fitTo == ResizeMode::FIXED_WIDTH || fitTo == ResizeMode::FIXED_HEIGHT)) {
+        originalSize = getSizeWithMetadata(reader);
+        rotatedByMetadata = isRotatedByMetadata(reader);
     }
 
-    return fileList;
-}
-
-QString getRootFolder(QList<QString> folderMap)
-{
-    QStringListIterator it(folderMap);
-    QString rootFolderPath = folderMap.first();
-    while (it.hasNext()) {
-        QString newFolderPath = it.next();
-        QStringList splitNewFolder = QDir::toNativeSeparators(newFolderPath).split(QDir::separator());
-        QStringList splitRootFolder = QDir::toNativeSeparators(rootFolderPath).split(QDir::separator());
-        QStringList splitCommonPath;
-
-        for (int i = 0; i < (std::min)(splitNewFolder.count(), splitRootFolder.count()); i++) {
-            if (QString::compare(splitNewFolder.at(i), splitRootFolder.at(i)) != 0) {
-                if (i == 0) {
-                    rootFolderPath = QDir::rootPath();
-                } else {
-                    rootFolderPath = QDir(splitCommonPath.join(QDir::separator())).absolutePath();
-                }
-                break;
-            }
-            splitCommonPath.append(splitNewFolder.at(i));
-        }
-        rootFolderPath = QDir(splitCommonPath.join(QDir::separator())).absolutePath();
-    }
-
-    return rootFolderPath;
-}
-
-std::tuple<unsigned int, unsigned int> cResize(QSize originalSize, int fitTo, int width, int height, int size, bool doNotEnlarge)
-{
     int originalWidth = originalSize.width();
     int originalHeight = originalSize.height();
 
@@ -106,9 +70,31 @@ std::tuple<unsigned int, unsigned int> cResize(QSize originalSize, int fitTo, in
             return { originalWidth, originalHeight };
         }
 
-        int outputWidth = (int)round((double)originalWidth * (double)outputWidthPerc / 100);
-        int outputHeight = (int)round((double)originalHeight * (double)outputHeightPerc / 100);
+        int outputWidth = static_cast<int>(round(static_cast<double>(originalWidth) * static_cast<double>(outputWidthPerc) / 100));
+        int outputHeight = static_cast<int>(round(static_cast<double>(originalHeight) * static_cast<double>(outputHeightPerc) / 100));
         return { outputWidth, outputHeight };
+    } else if (fitTo == ResizeMode::FIXED_WIDTH) {
+        if (doNotEnlarge && keepMetadata && width > originalWidth) {
+            return { 0, 0 };
+        } else if (doNotEnlarge && !keepMetadata && width > originalWidth) {
+            return { originalWidth, originalHeight };
+        }
+
+        if (rotatedByMetadata && keepMetadata) {
+            return { 0, width };
+        }
+        return { width, 0 };
+    } else if (fitTo == ResizeMode::FIXED_HEIGHT) {
+        if (doNotEnlarge && keepMetadata && height > originalHeight) {
+            return { 0, 0 };
+        } else if (doNotEnlarge && !keepMetadata && height > originalHeight) {
+            return { originalWidth, originalHeight };
+        }
+
+        if (rotatedByMetadata && keepMetadata) {
+            return { height, 0 };
+        }
+        return { 0, height };
     } else if (fitTo == ResizeMode::LONG_EDGE || fitTo == ResizeMode::SHORT_EDGE) {
         // TODO Refactor this section
         if ((fitTo == ResizeMode::LONG_EDGE && originalWidth >= originalHeight) || (fitTo == ResizeMode::SHORT_EDGE && originalWidth <= originalHeight)) {
@@ -132,17 +118,14 @@ void showFileInNativeFileManager(const QString& filePath, const QString& fallbac
     if (!QFileInfo::exists(filePath)) {
         QCaesiumMessageBox msgBox;
         msgBox.setText(QIODevice::tr("File not found"));
-        msgBox.setStandardButtons(QMessageBox::Ok);
-        msgBox.setDefaultButton(QMessageBox::Ok);
+        msgBox.addButton(QIODevice::tr("Ok"), QMessageBox::AcceptRole);
         msgBox.exec();
         return;
     }
 
 #if defined(Q_OS_WIN)
-    QStringList param;
-    param += QLatin1String("/select,");
-    param += QDir::toNativeSeparators(filePath);
-    if (QProcess::startDetached("explorer.exe", param)) {
+    QStringList param = QStringList { "/select", ",", filePath };
+    if (QProcess::startDetached("explorer", param)) {
         return;
     }
 #elif defined(Q_OS_MAC)
@@ -150,6 +133,11 @@ void showFileInNativeFileManager(const QString& filePath, const QString& fallbac
         return;
 #endif
     QDesktopServices::openUrl(QUrl::fromLocalFile(fallbackDirectory));
+}
+
+void showDirectoryInNativeFileManager(const QString& dirPath)
+{
+    QDesktopServices::openUrl(QUrl::fromLocalFile(dirPath));
 }
 
 QJsonObject getSystemData()
@@ -202,4 +190,48 @@ QString hashString(const QString& data, QCryptographicHash::Algorithm algorithm)
     QCryptographicHash hash = QCryptographicHash(algorithm);
     hash.addData(data.toUtf8());
     return QString::fromUtf8(hash.result().toHex());
+}
+
+QStringList getOutputSupportedFormats()
+{
+    return {
+        QIODevice::tr("Same as input"),
+        QIODevice::tr("JPG"),
+        QIODevice::tr("PNG"),
+        QIODevice::tr("WebP"),
+        QIODevice::tr("TIFF"),
+    };
+}
+
+bool isRotatedByMetadata(const QImageReader* reader)
+{
+    QFlags<QImageIOHandler::Transformation> transformation = reader->transformation();
+    return (transformation == QImageIOHandler::TransformationRotate90
+        || transformation == QImageIOHandler::TransformationMirrorAndRotate90
+        || transformation == QImageIOHandler::TransformationFlipAndRotate90
+        || transformation == QImageIOHandler::TransformationRotate270);
+}
+
+QSize getSizeWithMetadata(const QImageReader* reader)
+{
+    QSize imageSize = reader->size();
+    QSize actualSize(imageSize.width(), imageSize.height());
+    // We need to check if the image is rotated by metadata and adjust the values accordingly
+    if (isRotatedByMetadata(reader)) {
+        actualSize.setWidth(imageSize.height());
+        actualSize.setHeight(imageSize.width());
+    }
+
+    return actualSize;
+}
+
+QMap<int, QString> getChromaSubsamplingOptions()
+{
+    return {
+        { JPEGChromaSubsampling::CHROMA_AUTO, QIODevice::tr("Auto") },
+        { JPEGChromaSubsampling::CHROMA_444, QString("4:4:4") },
+        { JPEGChromaSubsampling::CHROMA_422, QString("4:2:2") },
+        { JPEGChromaSubsampling::CHROMA_420, QString("4:2:0") },
+        { JPEGChromaSubsampling::CHROMA_411, QString("4:1:1") },
+    };
 }

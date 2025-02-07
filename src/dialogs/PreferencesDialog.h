@@ -15,28 +15,31 @@ public:
     ~PreferencesDialog() override;
 
 private slots:
-    void onLanguageChanged(int index);
-    void onThemeChanged(int index);
+    void onLanguageChanged(int index) const;
+    void onThemeChanged(int index) const;
+    void onThemeVariantChanged(int index) const;
     static int getLocaleIndex();
     static void onArgsBehaviourChanged(int index);
-    static void onSkipBySizeToggled(bool checked);
-    static void onSkipBySizeConditionChanged(int index);
-    static void onSkipBySizeValueChanged(int value);
-    static void onSkipBySizeUnitChanged(int index);
     static void onPromptExitToggled(bool checked);
     static void onCheckUpdatesAtStartupToggled(bool checked);
     static void onImportSubfoldersToggled(bool checked);
     static void onSendUsageReportToggled(bool checked);
     static void onMultithreadingToggled(bool checked);
-    static void onShowUsageDataLinkActivated(const QString& link);
+    static void onShowUsageDataLinkActivated([[maybe_unused]] const QString& link);
+    static void onSkipCompressionDialogsToggled(bool checked);
+    static void onMultithreadingMaxThreadsChanged(int value);
+    static void onPostCompressionActionChanged(int value);
+    static void onRestartButtonPressed();
+    static void onThreadsPriorityChanged(int value);
 
 private:
     Ui::PreferencesDialog* ui;
 
     void setupConnections();
-    void loadPreferences();
-    void loadLanguages();
-    void loadThemes();
+    void loadPreferences() const;
+    void loadLanguages() const;
+    void loadThemes() const;
+    void changeEvent(QEvent* event) override;
 };
 
 #endif // PREFERENCESDIALOG_H

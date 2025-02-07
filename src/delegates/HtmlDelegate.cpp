@@ -18,7 +18,7 @@ void HtmlDelegate::paint(QPainter* painter, const QStyleOptionViewItem& option, 
 
     // Painting item without text
     optionV.text = QString();
-    style->drawControl(QStyle::CE_ItemViewItem, &optionV, painter);
+    style->drawControl(QStyle::CE_ItemViewItem, &optionV, painter, optionV.widget);
 
     QAbstractTextDocumentLayout::PaintContext ctx;
     QRect textRect = style->subElementRect(QStyle::SE_ItemViewItemText, &optionV);
@@ -38,5 +38,5 @@ QSize HtmlDelegate::sizeHint(const QStyleOptionViewItem& option, const QModelInd
     QTextDocument doc;
     doc.setHtml(optionV.text);
     doc.setTextWidth(optionV.rect.width());
-    return {static_cast<int>(doc.idealWidth()), 24};
+    return { static_cast<int>(doc.idealWidth()), 24 };
 }

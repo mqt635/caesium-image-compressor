@@ -1,32 +1,11 @@
 #ifndef CIMAGE_H
 #define CIMAGE_H
 
-#include <QFileInfo>
-#include <QString>
-
+#include "../include/libcaesium.h"
 #include "../utils/Utils.h"
 
-typedef struct CCSParameters {
-    bool keep_metadata;
-    unsigned int jpeg_quality;
-    unsigned int png_quality;
-    bool png_force_zopfli;
-    unsigned int gif_quality;
-    unsigned int webp_quality;
-    bool optimize;
-    int width;
-    int height;
-} CCSParameters;
-
-struct CCSResult {
-    bool success;
-    char* error_message;
-};
-
-extern "C" CCSResult c_compress(const char* i, const char* o, struct CCSParameters params);
-
 class CImage {
-    const QList<QByteArray> supportedFormats = { "png", "jpg", "jpeg", "webp" };
+    const QList<QByteArray> supportedFormats = { "png", "jpg", "jpeg", "webp", "tiff" };
 
 public:
     explicit CImage(const QString& path);
@@ -34,10 +13,10 @@ public:
     friend bool operator==(const CImage& c1, const CImage& c2);
     friend bool operator!=(const CImage& c1, const CImage& c2);
 
-    QString getFormattedSize();
-    QString getRichFormattedSize();
-    QString getResolution();
-    QString getRichResolution();
+    QString getFormattedSize() const;
+    QString getRichFormattedSize() const;
+    QString getResolution() const;
+    QString getRichResolution() const;
     QString getFileName() const;
     QString getFullPath() const;
     size_t getOriginalSize() const;
@@ -45,10 +24,10 @@ public:
     CImageStatus getStatus() const;
     void setStatus(const CImageStatus& value);
     double getRatio() const;
-    QString getFormattedSavedRatio();
-    QString getRichFormattedSavedRatio();
+    QString getFormattedSavedRatio() const;
+    QString getRichFormattedSavedRatio() const;
     bool compress(const CompressionOptions& compressionOptions);
-    bool preview(const CompressionOptions& compressionOptions);
+    bool preview(const CompressionOptions& compressionOptions) const;
     QString getCompressedFullPath() const;
     QString getTemporaryPreviewFullPath() const;
     QString getPreviewFullPath() const;
@@ -58,7 +37,7 @@ public:
     QString getCompressedDirectory() const;
     QString getHashedFullPath() const;
     QString getFormat() const;
-    CCSParameters getCSParameters(const CompressionOptions& compressionOptions);
+    CCSParameters getCSParameters(const CompressionOptions& compressionOptions) const;
 
 private:
     CImageStatus status;
@@ -71,10 +50,7 @@ private:
     QString hashedFullPath;
     QString extension;
     QString format;
-public:
 
-
-private:
     size_t size;
     size_t compressedSize;
 
@@ -83,9 +59,9 @@ private:
     int compressedWidth;
     int compressedHeight;
 
-    void setCompressedInfo(QFileInfo fileInfo);
-    void setFileDates(QFileInfo fileInfo, FileDatesOutputOption datesMap, FileDates inputFileDates);
-    QSize getSizeWithMetadata(QImageReader *reader);
+    void setCompressedInfo(const QFileInfo& fileInfo);
+    static void setFileDates(const QFileInfo& fileInfo, FileDatesOutputOption datesMap, const FileDates& inputFileDates);
+    static size_t getMaxOutputSizeInBytes(MaxOutputSize maxOutputSize, size_t originalSize);
 };
 
 #endif // CIMAGE_H

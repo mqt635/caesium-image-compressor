@@ -109,6 +109,8 @@ Thumbs.db
 # *.iml
 # *.ipr
 
+.idea/**/copilot
+
 # CMake
 cmake-build-*/
 
@@ -161,3 +163,5 @@ package
 Output
 deploy.py
 manifests
+build
+ts.py
